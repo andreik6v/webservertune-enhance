@@ -304,7 +304,7 @@ def watch(config, logger, api_client):
             logger.debug(f"[{uuid}] Org not found in cache, skipping sync")
             return
 
-        domains_data = api_client.get(f"/orgs/{org_id}/websites/{uuid}/domains", logger)
+        domains_data = api_client.get_website_domains(org_id, uuid, logger)
         if domains_data is None:
             return
 

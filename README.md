@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.6.1  
+**Version:** 0.6.2  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -8,7 +8,7 @@
 
 webservertune-enhance is an automated configuration service for Enhance hosting control panel servers that handles both Nginx and OpenLiteSpeed webservers. It monitors for configuration changes and re-applies settings automatically without manual intervention, adding features and resolving limitations in how Enhance implements each webserver.
 
-Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.21.3.
+Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.22.2.
 
 ## Features
 
@@ -46,7 +46,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Enhance hosting environment
 - Python 3.11+ (default on Ubuntu 24.04)
 - Dependencies: `apt install inotify-tools python3-httpx python3-h2`
-- Enhance installed updated Nginx (1.28.0) or OpenLiteSpeed (1.8.5)
+- Enhance installed updated Nginx (1.30.2) or OpenLiteSpeed (1.9.0)
 
 ## Installation
 
@@ -230,6 +230,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
+
+**0.6.2** — Merge PR for fastcgiclear mu-plugin extra options. Bugfixes for API performance.
 
 **0.6.1** — Fix HTTP/1.1 issue of communication with API from controlpanel server. Switch to httpx + h2 libraries for HTTP/2 to API. New dependencies must be installed before updating to this version.
 
