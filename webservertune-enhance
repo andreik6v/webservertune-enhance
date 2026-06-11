@@ -179,7 +179,7 @@ def main():
             fcc_logger   = setup_logger("fastcgiclear", log_level)
             t_fcc        = threading.Thread(
                 target=fastcgiclear.watch,
-                args=(config, fcc_logger, api_client),
+                args=(config, fcc_logger),
                 daemon=True
             )
             t_fcc.start()
