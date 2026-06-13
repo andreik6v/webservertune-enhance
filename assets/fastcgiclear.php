@@ -2,8 +2,7 @@
 
 /**
  * Plugin Name: Clear cache after update
- * Description: Clears Nginx FastCGI cache on plugin/theme/core updates and on
- *              content changes (publishing/editing posts & pages, comments).
+ * Description: Clears Nginx FastCGI cache on plugin/theme/core updates and on content changes (publishing/editing posts & pages, comments).
  * Version: 1.1.0
  * Author: rdbf
  */
