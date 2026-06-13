@@ -3,7 +3,7 @@
 fastcgiclear
 FastCGI cache clearing for Enhance hosting environments.
 Monitors for cache=stale flag files written by the WordPress mu-plugin
-and clears FastCGI cache via the Enhance API for all domains in the webspace.
+and clears FastCGI cache directly from the filesystem.
 Called by webservertune-enhance main program.
 """
 
@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 WWW_DIR        = Path("/var/www")
+SITES_DIR      = Path("/etc/nginx/sites-enabled")
 FLAG_FILE      = "clear.cache"
 MU_PLUGIN_NAME = "fastcgiclear.php"
 MU_PLUGIN_SRC  = Path("/opt/webservertune-enhance/assets") / MU_PLUGIN_NAME
@@ -26,18 +27,16 @@ UUID_RE = re.compile(
     re.IGNORECASE
 )
 
+_CACHE_PATH_RE = re.compile(r'fastcgi_cache_path\s+(\S+)')
+
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def watch(config, logger, api_client):
+def watch(config, logger):
     """Entry point called by main program."""
     logger.info("fastcgiclear starting")
-
-    if not api_client.is_configured():
-        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
-        return
 
     general       = config.get("general", {})
     debounce_secs = general.get("debounce_seconds", 10)
@@ -137,35 +136,58 @@ def watch(config, logger, api_client):
 
 
     # ---------------------------------------------------------------------------
-    # API
+    # Cache clearing
     # ---------------------------------------------------------------------------
+
+    def _find_cache_paths(uuid):
+        """
+        Find all FastCGI cache directories for a UUID by scanning vhost configs.
+        A single webspace can have multiple domains, each with its own cache path.
+        Returns a list of cache directory Paths.
+        """
+        paths = []
+        try:
+            for cf in SITES_DIR.glob("*.conf"):
+                if cf.name.startswith("000-"):
+                    continue
+                content = cf.read_text()
+                if uuid not in content:
+                    continue
+                for line in content.splitlines():
+                    m = _CACHE_PATH_RE.match(line.strip())
+                    if m:
+                        paths.append(Path(m.group(1)))
+        except Exception as e:
+            logger.error(f"[{uuid}] Failed to find cache paths: {e}")
+        return paths
 
     def _do_clear(uuid):
         """
-        Clear FastCGI cache for all domains in the webspace via the Enhance API,
-        then reset the flag file to cache=cleared.
+        Clear FastCGI cache for all domains in the webspace by removing
+        cached files directly from the filesystem, then reset the flag file.
         """
         logger.info(f"[{uuid}] Clearing FastCGI cache")
 
-        org_id = api_client.get_org_id(uuid, logger)
-        if not org_id:
-            logger.debug(f"[{uuid}] Org not found, skipping cache clear")
+        cache_paths = _find_cache_paths(uuid)
+        if not cache_paths:
+            logger.debug(f"[{uuid}] No cache paths found, skipping")
             return
 
-        data = api_client.get(f"/orgs/{org_id}/websites/{uuid}/domains", logger)
-        if data is None:
-            return
-
-        for item in data.get("items", []):
-            domain_id   = item.get("domainId")
-            domain_name = item.get("domain", domain_id)
-            if not domain_id:
+        for cache_dir in cache_paths:
+            if not cache_dir.is_dir():
                 continue
-            ok = api_client.delete(f"/v2/domains/{domain_id}/nginx_fastcgi", logger)
-            if ok:
-                logger.info(f"[{uuid}] Cleared cache for {domain_name}")
-            else:
-                logger.error(f"[{uuid}] Failed to clear cache for {domain_name}")
+            try:
+                for entry in cache_dir.iterdir():
+                    try:
+                        if entry.is_dir():
+                            shutil.rmtree(entry)
+                        else:
+                            entry.unlink()
+                    except Exception:
+                        pass
+                logger.info(f"[{uuid}] Cleared cache dir {cache_dir}")
+            except Exception as e:
+                logger.error(f"[{uuid}] Failed to clear cache dir {cache_dir}: {e}")
 
         flag = WWW_DIR / uuid / FLAG_FILE
         pw   = _get_webspace_pw(uuid)
