@@ -259,5 +259,5 @@ Adjust settings as required, as this config saves 15 weekly logs.
 
 ## Contributors
 
-- [andreik6v](https://github.com/andreik6v) — FastCGI cache clearing: Trigger on various situation where content changes are applied
-- [dalet11](https://github.com/dalet11) — FastCGI cache clearing: Removed Enhance API dependency
+- [andreik6v](https://github.com/andreik6v) — FastCGI cache clearing: Trigger on various situations where content changes are applied.
+- [dalet11](https://github.com/dalet11) — FastCGI cache clearing: Removed Enhance API dependency.
