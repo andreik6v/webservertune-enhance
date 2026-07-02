@@ -149,13 +149,14 @@ All settings are controlled through `settings.conf` in TOML format. All features
 
 Settings under `[nginx-cacheexclude]`. Writes per-domain `skip_cache` rules to `/opt/webservertune-enhance/cache-excludes/<domain>.conf`, included into each vhost after its `vhost_includes` line. The rules run in Nginx's rewrite phase and only ever raise `$skip_cache` to `1`, extending Enhance's built-in exclusions rather than replacing them.
 
-Rules safe for any WordPress site are always written: custom login pages (`/login.*`), the REST API (`/wp-json/`), and `/.well-known.*`. WooCommerce rules (store/cart/checkout/account paths and the `woocommerce_items_in_cart` cookie) are written **only** to vhosts where WooCommerce is detected at the document root, because the cart-cookie rule would otherwise disable caching on non-WooCommerce sites. WooCommerce status is re-checked on vhost changes and on a periodic rescan, so installing WooCommerce later is picked up automatically.
+Rules safe for any WordPress site are always written: custom login pages (`/login.*`), the REST API (`/wp-json/`), and `/.well-known.*`. WooCommerce rules (store/cart/checkout/account paths and the `woocommerce_items_in_cart` cookie) are written **only** to vhosts where WooCommerce is detected at the document root, because the cart-cookie rule would otherwise disable caching on non-WooCommerce sites.
+
+This is a sub-module of `nginxtune`: file generation and the include injection both run inside `nginxtune`'s `run()` (guarded by its backup → `nginx -t` → reload/restore flow) and are cleared by its `cleanup()`. Detection therefore refreshes on service start, on any vhost add/remove/change, and on config changes — so installing WooCommerce on an existing site is picked up on the next vhost change or a service restart.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `false` | Load and start the nginxcacheexclude module and inject the per-domain include — Nginx only |
+| `enabled` | `false` | Generate the per-domain cache-exclude files and inject their includes — Nginx only |
 | `woocommerce` | `true` | Add WooCommerce-specific exclusions to detected WooCommerce sites |
-| `rescan_interval_seconds` | `21600` | Interval for re-detecting WordPress/WooCommerce status across all sites (6h default) |
 
 ### OLS Webserver Settings
 

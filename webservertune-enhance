@@ -194,16 +194,6 @@ def main():
             )
             t_redir.start()
 
-        if config.get("nginx-cacheexclude", {}).get("enabled", False):
-            nginxcacheexclude = load_module("nginxcacheexclude")
-            ce_logger         = setup_logger("nginxcacheexclude", log_level)
-            t_ce              = threading.Thread(
-                target=nginxcacheexclude.watch,
-                args=(config, ce_logger),
-                daemon=True
-            )
-            t_ce.start()
-
     elif webserver == "ols":
         _wait_for_ols_active(config, logger)
 

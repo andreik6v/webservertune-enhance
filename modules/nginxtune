@@ -6,6 +6,7 @@ Manages HTTP/3, security includes, logging, FastCGI cache and body size settings
 Called by webservertune-enhance main program.
 """
 
+import importlib.util
 import logging
 import os
 import re
@@ -14,6 +15,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 SITES_DIR     = Path("/etc/nginx/sites-enabled")
@@ -24,6 +26,32 @@ REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
 CACHE_EXCLUDES_DIR = Path("/opt/webservertune-enhance/cache-excludes")
 NGINX_DROPIN  = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
 ALT_SVC       = 'h3=":443"; ma=86400'
+
+# nginxcacheexclude is a sub-module invoked from run()/cleanup() so that all
+# vhost/cache-exclude file changes flow through this module's backup/test/reload
+# path. Loaded lazily and cached.
+MODULES_DIR        = Path(__file__).resolve().parent
+_cacheexclude_mod  = None
+
+
+def _apply_cache_excludes(config, logger):
+    """Load the nginxcacheexclude sub-module (once) and regenerate its files.
+
+    Returns True if any cache-exclude file changed. Never reloads nginx itself —
+    the caller's run() handles nginx -t and reload/restore.
+    """
+    global _cacheexclude_mod
+    try:
+        if _cacheexclude_mod is None:
+            path   = MODULES_DIR / "nginxcacheexclude"
+            loader = SourceFileLoader("nginxcacheexclude", str(path))
+            spec   = importlib.util.spec_from_loader("nginxcacheexclude", loader)
+            _cacheexclude_mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(_cacheexclude_mod)
+        return _cacheexclude_mod.apply(config, logger)
+    except Exception as e:
+        logger.error(f"cache-exclude apply failed: {e}")
+        return False
 
 SENTINEL_BEGIN = "# Custom nginxtune config"
 SENTINEL_END   = "# End custom nginxtune config"
@@ -152,6 +180,8 @@ def run(config, logger):
     changed |= apply_nginx_conf(config, logger)
     changed |= apply_http3_enable(config, logger)
     changed |= apply_quic_gso_enable(config, logger)
+    # generate cache-exclude files before their includes are (re)confirmed below
+    changed |= _apply_cache_excludes(config, logger)
     changed |= apply_include_features(config, logger)
     changed |= apply_logging_features(config, logger)
     changed |= apply_fastcgi_cache_settings(config, logger)
@@ -1121,6 +1151,8 @@ def cleanup(logger):
     apply_nginx_conf(            {}, logger)
     apply_http3_enable(          {}, logger)
     apply_quic_gso_enable(       {}, logger)
+    # remove generated cache-exclude files, then strip their include lines
+    _apply_cache_excludes(       {}, logger)
     apply_include_features(      {}, logger)
     apply_logging_features(      {}, logger)
     apply_fastcgi_cache_settings({}, logger)

@@ -4,38 +4,32 @@ nginxcacheexclude
 Generates per-domain FastCGI cache-exclude include files for Enhance vhosts.
 
 Enhance's panel only allows simple URI prefixes to be excluded from the FastCGI
-cache. This module writes additional skip_cache rules — covering custom login
-pages, the REST API, /.well-known, and (when detected) WooCommerce store/cart
-pages — into /opt/webservertune-enhance/cache-excludes/<domain>.conf.
+cache. This sub-module writes additional skip_cache rules — covering custom
+login pages, the REST API, /.well-known, and (when detected) WooCommerce
+store/cart pages — into /opt/webservertune-enhance/cache-excludes/<domain>.conf.
 
 The Enhance-generated vhost already does `set $skip_cache 0;` at server scope and
-reads it via `fastcgi_cache_bypass $skip_cache;` inside the PHP location. The
-include is injected after the `include vhost_includes/<domain>.conf;` line by
-nginxtune.apply_include_features(); the rules here run in the rewrite phase and
-only ever raise $skip_cache to 1, so they can add bypass conditions but never
-re-enable caching.
+reads it via `fastcgi_cache_bypass $skip_cache;` inside the PHP location.
+nginxtune.apply_include_features() injects `include .../cache-excludes/<domain>.conf;`
+after the `include vhost_includes/<domain>.conf;` line. These rules run in the
+rewrite phase and only ever raise $skip_cache to 1, so they add bypass conditions
+but never re-enable caching.
 
 WooCommerce-specific rules are written ONLY for vhosts where WooCommerce is
 detected, because the `woocommerce_items_in_cart` cookie rule would otherwise
 disable caching entirely on non-WooCommerce sites.
 
-Called by webservertune-enhance main program.
+This module does not modify vhosts, reload nginx, or run any threads of its own.
+It exposes a single apply() function that nginxtune calls from within its
+run()/cleanup() flow, so file generation participates in nginxtune's existing
+backup → nginx -t → reload/restore safety net.
 """
 
-import re
-import subprocess
-import threading
-import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 SITES_DIR          = Path("/etc/nginx/sites-enabled")
 CACHE_EXCLUDES_DIR = Path("/opt/webservertune-enhance/cache-excludes")
-
-UUID_RE = re.compile(
-    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-    re.IGNORECASE
-)
 
 # Rules that are safe on ANY WordPress site (URI-only, no cookie logic).
 SAFE_RULES = [
@@ -77,265 +71,165 @@ HEADER = "# Managed by webservertune-enhance (nginx-cacheexclude). Do not edit b
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Vhost helpers
 # ---------------------------------------------------------------------------
 
-def watch(config, logger):
-    """Entry point called by main program."""
-    logger.info("nginxcacheexclude starting")
-
-    general          = config.get("general", {})
-    section          = config.get("nginx-cacheexclude", {})
-    debounce_secs    = general.get("debounce_seconds", 10)
-    woocommerce_on   = section.get("woocommerce", True)
-    rescan_interval  = section.get("rescan_interval_seconds", 21600)
-
-    CACHE_EXCLUDES_DIR.mkdir(parents=True, exist_ok=True)
-
-    sites_debounce_timer = [None]
-    sites_debounce_lock  = threading.Lock()
-
-
-    # ---------------------------------------------------------------------------
-    # Vhost helpers
-    # ---------------------------------------------------------------------------
-
-    def _site_confs():
-        """Return all vhost conf files, excluding the control panel 000- prefix and default.conf."""
+def _site_confs():
+    """Return all vhost conf files, excluding the control panel 000- prefix and default.conf."""
+    try:
         return [
             f for f in SITES_DIR.glob("*.conf")
             if not f.name.startswith("000-") and f.name != "default.conf"
         ]
+    except Exception:
+        return []
 
-    def _docroot_from_conf(cf):
-        """Extract the document root from a vhost's `root "...";` directive."""
+
+def _docroot_from_conf(cf):
+    """Extract the document root from a vhost's `root "...";` directive."""
+    try:
+        for line in cf.read_text().splitlines():
+            s = line.strip()
+            if s.startswith("root "):
+                val = s[len("root "):].strip().rstrip(";").strip().strip('"').strip("'")
+                return Path(val)
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WordPress / WooCommerce detection
+# ---------------------------------------------------------------------------
+
+def _detect(docroot):
+    """
+    Return (is_wordpress, is_woocommerce) for a document root.
+    Checks the docroot itself and its immediate subdirectories (covers WP
+    installed in a subdirectory) without recursing into large trees.
+    """
+    if not docroot or not docroot.is_dir():
+        return (False, False)
+
+    candidates = [docroot]
+    try:
+        candidates += [d for d in docroot.iterdir()
+                       if d.is_dir() and not d.name.startswith(".")]
+    except Exception:
+        pass
+
+    is_wp = False
+    is_wc = False
+    for root in candidates:
         try:
-            for line in cf.read_text().splitlines():
-                s = line.strip()
-                if s.startswith("root "):
-                    val = s[len("root "):].strip().rstrip(";").strip().strip('"').strip("'")
-                    return Path(val)
+            if (root / "wp-load.php").exists():
+                is_wp = True
+                wc = root / "wp-content" / "plugins" / "woocommerce" / "woocommerce.php"
+                if wc.exists():
+                    is_wc = True
+                    break
         except Exception:
-            pass
-        return None
+            continue
+    return (is_wp, is_wc)
 
 
-    # ---------------------------------------------------------------------------
-    # WordPress / WooCommerce detection
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Content generation
+# ---------------------------------------------------------------------------
 
-    def _detect(docroot):
-        """
-        Return (is_wordpress, is_woocommerce) for a document root.
-        Checks the docroot itself and its immediate subdirectories (covers WP
-        installed in a subdirectory) without recursing into large trees.
-        """
-        if not docroot or not docroot.is_dir():
-            return (False, False)
+def _build_content(is_wp, is_wc, woocommerce_on):
+    """Build the conf file body for a domain. Empty string for non-WordPress sites."""
+    if not is_wp:
+        return ""
+    blocks = [HEADER, ""] + SAFE_RULES
+    if is_wc and woocommerce_on:
+        blocks += [""] + WOOCOMMERCE_RULES
+    return "\n".join(blocks) + "\n"
 
-        candidates = [docroot]
+
+# ---------------------------------------------------------------------------
+# Entry point — called by nginxtune.run() / nginxtune.cleanup()
+# ---------------------------------------------------------------------------
+
+def _remove_all(logger):
+    """Remove every generated cache-exclude file. Returns True if any were removed."""
+    changed = False
+    if not CACHE_EXCLUDES_DIR.is_dir():
+        return False
+    for conf in CACHE_EXCLUDES_DIR.glob("*.conf"):
         try:
-            candidates += [d for d in docroot.iterdir()
-                           if d.is_dir() and not d.name.startswith(".")]
-        except Exception:
-            pass
-
-        is_wp = False
-        is_wc = False
-        for root in candidates:
-            try:
-                if (root / "wp-load.php").exists():
-                    is_wp = True
-                    wc = root / "wp-content" / "plugins" / "woocommerce" / "woocommerce.php"
-                    if wc.exists():
-                        is_wc = True
-                        break
-            except Exception:
-                continue
-        return (is_wp, is_wc)
-
-
-    # ---------------------------------------------------------------------------
-    # Content generation
-    # ---------------------------------------------------------------------------
-
-    def _build_content(is_wp, is_wc):
-        """Build the conf file body for a domain. Empty string for non-WordPress sites."""
-        if not is_wp:
-            return ""
-        blocks = [HEADER, ""] + SAFE_RULES
-        if is_wc and woocommerce_on:
-            blocks += [""] + WOOCOMMERCE_RULES
-        return "\n".join(blocks) + "\n"
-
-
-    # ---------------------------------------------------------------------------
-    # File writing and nginx reload (with rollback)
-    # ---------------------------------------------------------------------------
-
-    def _reload_nginx():
-        """Test nginx config and reload if valid. Returns True on successful reload."""
-        try:
-            test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
-            if test.returncode != 0:
-                logger.error(f"nginx -t failed: {test.stderr.strip()}")
-                return False
+            conf.unlink()
+            logger.info(f"Removed cache-exclude conf: {conf.name}")
+            changed = True
         except Exception as e:
-            logger.error(f"Failed to run nginx -t: {e}")
-            return False
-        try:
-            result = subprocess.run(
-                ["systemctl", "reload", "nginx"], capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                logger.info("nginx reloaded")
-                return True
-            logger.error(f"nginx reload failed: {result.stderr.strip()}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to reload nginx: {e}")
-            return False
+            logger.error(f"Failed to remove {conf.name}: {e}")
+    return changed
 
 
-    # ---------------------------------------------------------------------------
-    # Sync
-    # ---------------------------------------------------------------------------
+def apply(config, logger):
+    """
+    Regenerate per-domain cache-exclude include files to match the current set of
+    vhosts and their detected WordPress/WooCommerce status. Writes only changed
+    files and removes stale ones. Does NOT reload nginx — nginxtune validates and
+    reloads after all apply_* steps.
 
-    def _sync_all():
-        """
-        Regenerate cache-exclude confs for every vhost. Writes changed files,
-        validates with nginx -t, reloads on success, and rolls every changed file
-        back to its previous content if the test fails.
-        """
-        confs        = _site_confs()
-        current_doms = {cf.stem for cf in confs}
+    When the feature is disabled (or config is empty, as in nginxtune.cleanup()),
+    all generated files are removed so the include lines nginxtune strips no longer
+    point at anything.
 
-        # Detect in parallel — detection is filesystem stat work, safe to thread.
-        def detect_one(cf):
-            return (cf.stem, _detect(_docroot_from_conf(cf)))
+    Returns True if any file was written or removed.
+    """
+    section        = config.get("nginx-cacheexclude", {})
+    enabled        = section.get("enabled", False)
+    woocommerce_on = section.get("woocommerce", True)
 
-        detected = {}
+    if not enabled:
+        return _remove_all(logger)
+
+    CACHE_EXCLUDES_DIR.mkdir(parents=True, exist_ok=True)
+
+    confs        = _site_confs()
+    current_doms = {cf.stem for cf in confs}
+
+    # Detection is filesystem stat work — parallelise across sites.
+    def detect_one(cf):
+        return (cf.stem, _detect(_docroot_from_conf(cf)))
+
+    detected = {}
+    try:
         with ThreadPoolExecutor(max_workers=5) as ex:
             for domain, flags in ex.map(detect_one, confs):
                 detected[domain] = flags
+    except Exception as e:
+        logger.error(f"cache-exclude detection failed: {e}")
+        return False
 
-        changes = {}  # path -> (old_content, new_content)
+    changed = False
 
-        for cf in confs:
-            is_wp, is_wc = detected[cf.stem]
-            path     = CACHE_EXCLUDES_DIR / f"{cf.stem}.conf"
-            new      = _build_content(is_wp, is_wc)
-            existing = path.read_text() if path.exists() else None
-            if existing != new:
-                changes[path] = (existing, new)
+    for cf in confs:
+        is_wp, is_wc = detected.get(cf.stem, (False, False))
+        path     = CACHE_EXCLUDES_DIR / f"{cf.stem}.conf"
+        new      = _build_content(is_wp, is_wc, woocommerce_on)
+        existing = path.read_text() if path.exists() else None
+        if existing == new:
+            continue
+        try:
+            path.write_text(new)
+            kind = ("with WooCommerce" if (is_wc and woocommerce_on)
+                    else "WordPress" if is_wp else "empty (non-WordPress)")
+            logger.warning(f"cache-exclude: updated {cf.stem}.conf ({kind})")
+            changed = True
+        except Exception as e:
+            logger.error(f"Failed to write {path.name}: {e}")
 
-        # Remove stale confs for domains that no longer have a vhost.
-        for conf in CACHE_EXCLUDES_DIR.glob("*.conf"):
-            if conf.stem not in current_doms:
-                changes[conf] = (conf.read_text() if conf.exists() else None, None)
-
-        if not changes:
-            return
-
-        # Apply all changes.
-        for path, (_old, new) in changes.items():
+    # Remove confs for domains that no longer have a vhost.
+    for conf in CACHE_EXCLUDES_DIR.glob("*.conf"):
+        if conf.stem not in current_doms:
             try:
-                if new is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    path.write_text(new)
+                conf.unlink()
+                logger.warning(f"cache-exclude: removed stale {conf.name}")
+                changed = True
             except Exception as e:
-                logger.error(f"Failed to write {path.name}: {e}")
+                logger.error(f"Failed to remove {conf.name}: {e}")
 
-        # Validate; roll back everything if the combined config is invalid.
-        if not _reload_nginx():
-            logger.error("Rolling back cache-exclude changes after failed nginx -t")
-            for path, (old, _new) in changes.items():
-                try:
-                    if old is None:
-                        path.unlink(missing_ok=True)
-                    else:
-                        path.write_text(old)
-                except Exception as e:
-                    logger.error(f"Rollback failed for {path.name}: {e}")
-            return
-
-        for path, (_old, new) in changes.items():
-            if new is None:
-                logger.info(f"Removed stale cache-exclude conf: {path.name}")
-            else:
-                wc = "with WooCommerce" if "woocommerce_items_in_cart" in new else (
-                    "WordPress" if new else "empty (non-WordPress)")
-                logger.info(f"[{path.stem}] Updated cache-exclude conf ({wc})")
-
-
-    # ---------------------------------------------------------------------------
-    # sites-enabled watcher
-    # ---------------------------------------------------------------------------
-
-    def _schedule_sync():
-        with sites_debounce_lock:
-            if sites_debounce_timer[0] is not None:
-                sites_debounce_timer[0].cancel()
-            t = threading.Timer(debounce_secs, _sync_all)
-            sites_debounce_timer[0] = t
-            t.start()
-
-    def _sites_watcher_loop():
-        """Watch sites-enabled for vhost additions/removals and trigger a debounced resync."""
-        cmd = [
-            "inotifywait", "--monitor", "--quiet",
-            "--format", "%e %f",
-            "--event", "create",
-            "--event", "delete",
-            "--event", "moved_to",
-            "--event", "modify",
-            str(SITES_DIR),
-        ]
-        while True:
-            try:
-                logger.info(f"Watching {SITES_DIR} for vhost changes")
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
-            except FileNotFoundError:
-                logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
-                return
-            except Exception as e:
-                logger.error(f"Failed to start sites inotifywait: {e}")
-                time.sleep(5)
-                continue
-
-            for line in proc.stdout:
-                parts = line.strip().split(" ", 1)
-                if len(parts) != 2:
-                    continue
-                _, fname = parts
-                if not fname.endswith(".conf") or fname.startswith("000-") or fname == "default.conf":
-                    continue
-                _schedule_sync()
-
-            ret = proc.wait()
-            logger.warning(f"sites inotifywait exited (code {ret}), restarting in 5s")
-            time.sleep(5)
-
-
-    # ---------------------------------------------------------------------------
-    # periodic rescan — catches WooCommerce being installed/removed later
-    # ---------------------------------------------------------------------------
-
-    def _rescan_loop():
-        while True:
-            time.sleep(max(60, rescan_interval))
-            logger.debug("Periodic cache-exclude rescan")
-            _sync_all()
-
-
-    # ---------------------------------------------------------------------------
-    # Start
-    # ---------------------------------------------------------------------------
-
-    _sync_all()
-    threading.Thread(target=_sites_watcher_loop, daemon=True).start()
-    threading.Thread(target=_rescan_loop, daemon=True).start()
-
-    while True:
-        time.sleep(60)
+    return changed

@@ -32,9 +32,8 @@ client_max_body_size      = "200m"
 enabled = false
 
 [nginx-cacheexclude]
-enabled                 = false
-woocommerce             = true
-rescan_interval_seconds = 21600
+enabled     = false
+woocommerce = true
 
 [ols.general]
 #cpuAffinity  = "1"
