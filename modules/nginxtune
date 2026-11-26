@@ -1010,7 +1010,7 @@ def apply_logging_features(config, logger):
                                "alone on its line, not changing it")
             continue
 
-        lines = text.splitlines(keepends=True)
+        lines = nc.split_lines(text)
 
         pers_logs       = []      # args of current persistent access_logs
         n_pers_fmt      = 0
@@ -1094,6 +1094,8 @@ def apply_logging_features(config, logger):
                 continue
 
             elif _is_base_fmt(d):
+                if not line.endswith("\n"):
+                    line += "\n"
                 if realip_on and "$remote_addr" in s:
                     new_lines.append(line.replace("$remote_addr", "$actual_addr"))
                 elif not realip_on and "$actual_addr" in s:
@@ -1114,7 +1116,7 @@ def apply_logging_features(config, logger):
                 realip_added = True
 
             elif _is_enhance_log(d) and want and _enhance_log_uuid(d.args[0]) == uuid:
-                new_lines.append(line)
+                new_lines.append(line if line.endswith("\n") else line + "\n")
                 new_lines.append(f"{base}{expected_log}\n")
                 pers_added += 1
 

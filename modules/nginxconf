@@ -13,6 +13,8 @@ so checks on log destinations must happen before it.
 
 import glob
 import os
+import re
+import stat
 from collections import namedtuple
 
 NGINX_PREFIX = "/etc/nginx"      # nginx -V --prefix on Enhance servers
@@ -155,26 +157,61 @@ def _in_www(p):
     return False
 
 
+MAX_SYMLINK_HOPS = 40
+
+
 def _reaches_www(path):
-    """True if path, or any directory on the way to it, is /var/www or below once
-    symlinks are resolved -- the nginx master opens it as root, so a webspace
-    anywhere along the path is enough for the site user to redirect it."""
+    """True if resolving path the way the kernel does passes through /var/www at
+    any point: a component, any symlink hop (even one that later leads back
+    out), or the final target. The nginx master opens log files as root, so a
+    webspace anywhere on the way lets the site user redirect the open."""
     if _in_www(os.path.normpath(path)):
         return True
-    cur = ""
-    for comp in path.split("/")[1:]:
-        cur = f"{cur}/{comp}"
-        if _in_www(os.path.realpath(cur)):
+    parts, cur, hops = [p for p in path.split("/") if p], "/", 0
+    while parts:
+        comp = parts.pop(0)
+        if comp == ".":
+            continue
+        if comp == "..":
+            cur = os.path.dirname(cur) or "/"
+            if _in_www(cur):
+                return True
+            continue
+        nxt = os.path.join(cur, comp)
+        if _in_www(nxt):
             return True
-    return False
+        try:
+            st = os.lstat(nxt)
+        except OSError:
+            cur = nxt                      # does not exist (yet): the rest is literal
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > MAX_SYMLINK_HOPS:
+                return True                # cannot judge: refuse
+            try:
+                target = os.readlink(nxt)
+            except OSError:
+                return True
+            if _in_www(os.path.normpath(target if target.startswith("/") else os.path.join(cur, target))):
+                return True
+            if target.startswith("/"):
+                cur = "/"
+            parts = [p for p in target.split("/") if p] + parts
+            continue
+        cur = nxt
+    return _in_www(cur)
 
 
-def include_graph(root, prefix=NGINX_PREFIX):
+def include_graph(root, prefix=NGINX_PREFIX, conf_base=None):
     """Return ([(file, text, directives)], errors) for root and every file it
-    includes, recursively. Relative includes resolve against the directory of
-    the main config file, as nginx's conf prefix does. Literal includes that do
-    not exist and unreadable or unparseable files are reported as errors."""
-    conf_base = os.path.dirname(os.path.abspath(root))
+    includes, recursively. Relative includes resolve against conf_base, which
+    defaults to the directory of root (nginx's conf prefix when root is the main
+    config; pass it explicitly when root is a file nginx.conf includes).
+    Literal includes that do not exist and unreadable or unparseable files are
+    reported as errors."""
+    if conf_base is None:
+        conf_base = os.path.dirname(os.path.abspath(root))
     seen, out, errors = set(), [], []
     stack = [root]
     while stack:
@@ -214,12 +251,22 @@ def is_webspace_log(d, prefix=NGINX_PREFIX):
     dest = d.args[0]
     if dest == "off" or dest == "stderr" or dest.startswith(("syslog:", "memory:")):
         return False
+    if d.name == "error_log" or "$" not in dest:
+        # error_log never expands variables: nginx opens the literal path
+        return _reaches_www(_resolve(dest, prefix))
     if dest.startswith("$"):
         return True
-    path = _resolve(dest.split("$", 1)[0], prefix)
-    if "$" in dest:
-        path = os.path.dirname(path) or "/"
-    return _reaches_www(path)
+    pre  = dest.split("$", 1)[0]
+    path = _resolve(pre, prefix)
+    # the variable may begin with '/', so the text before it can be a directory
+    # itself (/var/www$x) as well as the start of a file name (/var/log/a$x)
+    return _reaches_www(path) or _reaches_www(os.path.dirname(path) or "/")
+
+
+def split_lines(text):
+    """Lines (with their '\\n') exactly as parse() counts them: only '\\n' ends
+    a line, unlike str.splitlines(), which also splits on \\f, \\v, \\x85 ..."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
 
 
 def sole_on_line(text, directives):

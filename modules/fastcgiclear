@@ -427,12 +427,17 @@ def find_cache_paths(uuid):
     want_log = f"/var/local/enhance/webserver_logs/{uuid}.log"
     if not SITES_DIR.is_dir():
         raise UnsafePath(f"{SITES_DIR} is not a directory")
+
+    def names_log(d):
+        return d.name == "access_log" and d.args[:1] == [want_log]
+
     paths, matched = [], 0
     for cf in sorted(SITES_DIR.glob("*.conf")):
         if cf.name.startswith("000-"):
             continue
         try:
-            content = cf.read_text()
+            # read-only: undecodable bytes in an unrelated vhost must not block clears
+            content = cf.read_text(encoding="utf-8", errors="surrogateescape")
         except FileNotFoundError:
             # removed or being regenerated: nginx may still serve it
             raise UnsafePath(f"{cf.name} disappeared while scanning")
@@ -442,8 +447,20 @@ def find_cache_paths(uuid):
             if want_log in content:
                 raise UnsafePath(f"{cf.name} cannot be parsed: {e}")
             continue
-        if not any(d.name == "access_log" and d.args[:1] == [want_log]
-                   and "server" in d.ctx and not set(d.ctx) & nc.DATA_BLOCKS for d in ds):
+        # the webspace's log anywhere but directly in a server block (another
+        # context, or a file this vhost includes) would hide a vhost and its
+        # cache zone: refuse rather than clear only part of the site
+        for d in ds:
+            if names_log(d) and not ("server" in d.ctx and not set(d.ctx) & nc.DATA_BLOCKS):
+                raise UnsafePath(f"{cf.name} names the webspace log outside a server block")
+        included, errors = nc.include_graph(str(cf), conf_base=nc.NGINX_PREFIX)
+        if errors:
+            if want_log in content or any(want_log in e for e in errors):
+                raise UnsafePath(f"{cf.name}: {errors[0]}")
+        for f, _text, ids in included[1:]:
+            if any(names_log(d) for d in ids):
+                raise UnsafePath(f"{cf.name} gets the webspace log from {f}")
+        if not any(names_log(d) for d in ds):
             continue
         matched += 1
         # the vhost file is included at http level: cache zones are its top-level
@@ -503,6 +520,8 @@ def clear_cache_dir(cache_dir):
     for entry in entries:
         try:
             is_dir = entry.is_dir(follow_symlinks=False)
+        except FileNotFoundError:
+            continue                    # expired meanwhile
         except OSError as e:
             errors.append(f"{entry.path}: {e}")
             continue
@@ -516,18 +535,18 @@ def clear_cache_dir(cache_dir):
             continue
         for _ in range(CLEAR_BUCKET_TRIES):
             errs = _rmtree_errors(entry.path)
-            if not errs or any(code != errno.ENOTEMPTY for code, _ in errs):
+            # POSIX lets rmdir report a non-empty directory as EEXIST too
+            if not errs or any(code not in (errno.ENOTEMPTY, errno.EEXIST) for code, _ in errs):
                 break
         errors.extend(msg for _, msg in errs)
     return errors
 
 
-def clear_site_cache(uuid, logger, done=None):
+def clear_site_cache(uuid, logger):
     """One attempt at emptying every cache dir of the webspace. True only if all
-    of them are known and were emptied completely (or do not exist yet).
-    Directories in `done` (emptied by an earlier attempt) are not emptied again;
-    successfully emptied ones are added to it."""
-    done = set() if done is None else done
+    of them are known and were emptied completely (or do not exist yet). Every
+    attempt empties every directory: a path is not proof that it is still the
+    directory an earlier attempt emptied."""
     try:
         cache_paths = find_cache_paths(uuid)
     except Exception as e:
@@ -553,11 +572,7 @@ def clear_site_cache(uuid, logger, done=None):
                            f"directly below {TRUSTED_CACHE_ROOT}")
             ok = False
             continue
-        if cache_dir in done:
-            continue
         errors = clear_cache_dir(cache_dir)
-        if not errors:
-            done.add(cache_dir)
         if errors:
             ok = False
             logger.warning(f"[{uuid}] Cache dir {cache_dir} only partly cleared "
@@ -684,9 +699,8 @@ def watch(config, logger):
         flag. Retried a few times because nginx keeps using the cache meanwhile;
         the flag is only reset after a complete clear."""
         logger.info(f"[{uuid}] Clearing FastCGI cache")
-        done = set()
         for attempt in range(1, CLEAR_ATTEMPTS + 1):
-            if clear_site_cache(uuid, logger, done):
+            if clear_site_cache(uuid, logger):
                 break
             if attempt < CLEAR_ATTEMPTS:
                 time.sleep(CLEAR_RETRY_SECS)

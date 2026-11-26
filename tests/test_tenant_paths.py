@@ -461,9 +461,25 @@ class FastcgiclearTests(unittest.TestCase):
             "map $a $b { fastcgi_cache_path /c/evil; }\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
-        # a top-level include in a matched vhost could declare more zones
+        # the webspace log outside a server block, or from an included file,
+        # could hide a vhost with its own cache zone: refuse
         (sites / "alias.conf").write_text(
-            "include /etc/nginx/zones.conf;\n"
+            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\nserver {{ listen 80; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        inc = self.tmp / "inc.conf"
+        inc.write_text(f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+        (sites / "alias.conf").write_text(
+            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            f"server {{ include {inc}; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        # a top-level include in a matched vhost could declare more zones
+        zones = self.tmp / "zones.conf"
+        zones.write_text("fastcgi_cache_path /c/zone levels=1:2;\n")
+        (sites / "alias.conf").write_text(
+            f"include {zones};\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
@@ -576,7 +592,7 @@ class FastcgiclearTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(os.listdir(c), [])
 
-    def test_clear_site_cache_skips_dirs_done_earlier(self):
+    def test_clear_site_cache_empties_every_dir_on_every_attempt(self):
         sites = self.tmp / "sites-enabled"
         sites.mkdir()
         croot = self.tmp / "nginx_cache"
@@ -586,12 +602,14 @@ class FastcgiclearTests(unittest.TestCase):
         (sites / "a.conf").write_text(f"fastcgi_cache_path {croot}/a.eu keys_zone=a:1m;\n"
                                       f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log a; }}\n")
         (croot / "a.eu" / "1").mkdir(parents=True)
-        done = set()
-        self.assertTrue(fcc.clear_site_cache(UUID, LOG, done))
-        self.assertEqual(done, {croot / "a.eu"})
-        (croot / "a.eu" / "new").mkdir()          # refilled after the first attempt
-        self.assertTrue(fcc.clear_site_cache(UUID, LOG, done))
-        self.assertTrue((croot / "a.eu" / "new").exists())
+        self.assertTrue(fcc.clear_site_cache(UUID, LOG))
+        # a directory restored at the same path (maybe with the same inode) is
+        # emptied again by the next attempt
+        import shutil as _sh
+        _sh.rmtree(croot / "a.eu")
+        (croot / "a.eu" / "old").mkdir(parents=True)
+        self.assertTrue(fcc.clear_site_cache(UUID, LOG))
+        self.assertEqual(os.listdir(croot / "a.eu"), [])
 
     def test_clear_cache_dir_reports_failures(self):
         if AS_ROOT:
@@ -937,6 +955,24 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertEqual(text.count("example.com_persistent '"), 1)
         self.assertNotIn('"example.com_persistent"', text)
 
+    def test_other_line_breaks_and_escaped_newlines_do_not_shift_lines(self):
+        c = ("set $x a\\\nb;\nadd_header X \"form\x0cfeed\x85next\";\n" + VHOST)
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(True))
+        self.assertIn('log_format example.com "', text)
+        self.assertEqual(text.count("log_format example.com_persistent '"), 1)
+        self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
+        self.assertTrue(text.startswith("set $x a\\\nb;\nadd_header X \"form\x0cfeed\x85next\";\n"))
+
+    def test_log_format_on_last_line_without_newline(self):
+        c = ("server {\n"
+             f"access_log /var/local/enhance/webserver_logs/{UUID}.log example.com;\n"
+             '}\nlog_format example.com "$remote_addr";')
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(True))
+        self.assertIn('log_format example.com "$remote_addr";\nlog_format example.com_persistent ', text)
+        nc.parse(text)
+
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code
         ngx.apply_logging_features(self.cfg(True), LOG)
@@ -1085,6 +1121,29 @@ class NginxConfTests(unittest.TestCase):
         files, errors = nc.include_graph(str(root / "nginx.conf"), prefix=str(other_prefix))
         self.assertEqual((len(files), errors), (2, []))
 
+    def test_symlink_hop_through_webspace_detected(self):
+        root = self._tree()
+        www = Path(tempfile.mkdtemp())
+        old = nc.WWW_DIR
+        nc.WWW_DIR = str(www)
+        self.addCleanup(setattr, nc, "WWW_DIR", old)
+        (www / "site").mkdir()
+        outside = Path(tempfile.mkdtemp())
+        # trusted link -> link inside the webspace (tenant controlled) -> back outside
+        (www / "site" / "hop").symlink_to(outside / "target.log")
+        (root / "x.log").symlink_to(www / "site" / "hop")
+        (root / "nginx.conf").write_text(f"access_log {root}/x.log; access_log {outside}/ok.log;\n")
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("x.log", problems[0])
+        # a symlink loop cannot be judged: refused
+        (root / "loop1").symlink_to(root / "loop2")
+        (root / "loop2").symlink_to(root / "loop1")
+        (root / "nginx.conf").write_text(f"access_log {root}/loop1/a.log;\n")
+        problems, _ = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(len(problems), 1)
+
     def test_symlink_into_webspace_and_variables_detected(self):
         root = self._tree()
         www = Path(tempfile.mkdtemp())
@@ -1095,13 +1154,17 @@ class NginxConfTests(unittest.TestCase):
         (root / "logs").symlink_to(www / "site")
         (root / "nginx.conf").write_text(
             "access_log logs/a.log;\n"                     # relative, through a symlink
-            "error_log $var/b.log;\n"                      # cannot be judged
+            "access_log $var/b.log;\n"                     # cannot be judged
             f"access_log {www}/site/$host.log;\n"          # variable inside the webspace
+            f"access_log {www}$x;\n"                       # the variable may start with '/'
+            f"error_log {www}/site/$x.log;\n"              # error_log: literal path, inside
+            "error_log $var/c.log;\n"                      # literal path below the prefix: fine
             "access_log off; error_log stderr; access_log syslog:server=x;\n"
             f"access_log {root}/fine.log;\n")
         problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
         self.assertEqual(errors, [])
-        self.assertEqual(len(problems), 3, problems)
+        self.assertEqual(len(problems), 5, problems)
+        self.assertFalse(any("c.log" in p for p in problems))
 
 
 if __name__ == "__main__":
