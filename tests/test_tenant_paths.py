@@ -13,6 +13,7 @@ up as a changed mode or content on the victim. Run with:
     python3 -m unittest discover -s tests -v
 """
 
+import errno
 import importlib.machinery
 import importlib.util
 import logging
@@ -336,12 +337,23 @@ class FastcgiclearTests(unittest.TestCase):
 
 
     def test_walk_is_breadth_first(self):
-        # a huge tree that sorts first must not hide a shallow WordPress root
-        for i in range(30):
-            (self.ws / "zzz-backups" / f"d{i}" / "x").mkdir(parents=True)
+        # huge trees sorting before and after public_html must not hide it,
+        # whichever end a depth-first search would start from
+        for big in ("aaa-backups", "zzz-backups"):
+            for i in range(30):
+                (self.ws / big / f"d{i}" / "x").mkdir(parents=True)
         self.wp("public_html")
         self._with(WALK_MAX_DIRS=10)
         res, note = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertEqual([r[0] for r in res], ["public_html/wp-content/mu-plugins/fastcgiclear.php"])
+
+    def test_wp_content_found_in_a_wide_directory(self):
+        root = self.wp("public_html")
+        for i in range(12):
+            (root / f"a{i:02d}").mkdir()
+        give_to_tenant(self.ws)
+        self._with(WALK_MAX_DIRS=5)
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
         self.assertEqual([r[0] for r in res], ["public_html/wp-content/mu-plugins/fastcgiclear.php"])
 
     def test_walk_entry_limit(self):
@@ -400,6 +412,8 @@ class FastcgiclearTests(unittest.TestCase):
             f"# moved from {UUID}\nroot /var/www/{UUID}/x;\n"
             "fastcgi_cache_path /c/b levels=1:2 keys_zone=b:10m;\n"
             f"access_log /var/local/enhance/webserver_logs/{other}.log b;\n")
+        # a vhost removed while scanning (here: dangling) is skipped
+        (sites / "gone.conf").symlink_to(sites / "does-not-exist.conf")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/ap"])
         (sites / "a-preview.conf").write_text(
             "fastcgi_cache_path \"/c/a p\" levels=1:2 keys_zone=ap:10m;\n"
@@ -437,10 +451,13 @@ class FastcgiclearTests(unittest.TestCase):
                 if onexc:
                     onexc(os.unlink, path, exc)
                 else:
-                    onerror(os.unlink, path, (exc_type, exc, None))
+                    onerror(os.unlink, path, (type(exc), exc, None))
             return rmtree
         try:
             fcc.shutil.rmtree = fake(FileNotFoundError)
+            self.assertEqual(fcc.clear_cache_dir(c), [])
+            (c / "3").mkdir()
+            fcc.shutil.rmtree = fake(lambda e, m, p: OSError(errno.ENOTEMPTY, m, p))
             self.assertEqual(fcc.clear_cache_dir(c), [])
             (c / "2").mkdir()
             fcc.shutil.rmtree = fake(PermissionError)

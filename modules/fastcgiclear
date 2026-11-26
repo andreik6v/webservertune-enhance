@@ -262,7 +262,7 @@ def find_wp_roots(ws_fd):
             fd = open_subdir(ws_fd, parts)
         except UnsafePath:
             continue
-        dirs, has_config = [], False
+        dirs, has_config, has_content = [], False, False
         try:
             with os.scandir(fd) as it:
                 for e in it:
@@ -272,8 +272,10 @@ def find_wp_roots(ws_fd):
                         break
                     try:
                         if e.is_dir(follow_symlinks=False):
+                            if e.name == "wp-content":
+                                has_content = True
                             # only directories that will be descended into are kept
-                            if len(dirs) < WALK_MAX_DIRS:
+                            elif len(parts) < WALK_MAX_DEPTH and len(dirs) < WALK_MAX_DIRS:
                                 dirs.append(e.name)
                         elif e.name == "wp-config.php" and e.is_file(follow_symlinks=False):
                             has_config = True
@@ -285,13 +287,13 @@ def find_wp_roots(ws_fd):
             os.close(fd)
         if note is not None:
             break
-        if has_config and "wp-content" in dirs:
+        if has_config and has_content:
             roots.append(parts)
             if len(roots) >= WALK_MAX_ROOTS:
                 note = f"stopped after {WALK_MAX_ROOTS} WordPress roots"
                 break
         if len(parts) < WALK_MAX_DEPTH:
-            for name in sorted(set(dirs) - {"wp-content"}):
+            for name in sorted(dirs):
                 if len(queue) >= WALK_MAX_DIRS:
                     break
                 queue.append(parts + [name])
@@ -328,9 +330,13 @@ def _mkdir_as(dir_fd, name, uid):
         creds = {}
     else:
         raise UnsafePath("cannot act as the site user")
-    r = subprocess.run([sys.executable, "-I", "-S", "-c", _MKDIR_CHILD, str(dir_fd), name],
-                       pass_fds=(dir_fd,), cwd="/", env={"LC_ALL": "C"},
-                       capture_output=True, timeout=30, **creds)
+    try:
+        r = subprocess.run([sys.executable, "-I", "-S", "-c", _MKDIR_CHILD, str(dir_fd), name],
+                           pass_fds=(dir_fd,), cwd="/", env={"LC_ALL": "C"},
+                           capture_output=True, timeout=5, **creds)
+    except subprocess.TimeoutExpired:
+        # the child runs as the site user, who can stop it; never wait long
+        raise UnsafePath("mkdir as site user timed out")
     if r.returncode != 0:
         err = r.stderr.decode("utf-8", "replace").strip().splitlines()
         raise UnsafePath(f"mkdir as site user failed: {err[-1] if err else r.returncode}")
@@ -391,7 +397,10 @@ def find_cache_paths(uuid):
     for cf in sorted(SITES_DIR.glob("*.conf")):
         if cf.name.startswith("000-"):
             continue
-        content = cf.read_text()
+        try:
+            content = cf.read_text()
+        except FileNotFoundError:
+            continue                    # vhost removed meanwhile
         if not log_re.search(content):
             continue
         found = []
@@ -408,12 +417,16 @@ def find_cache_paths(uuid):
 
 
 def clear_cache_dir(cache_dir):
-    """Empty a trusted cache directory. Entries that disappear meanwhile (nginx's
-    cache manager expiring them) are not errors. Returns a list of other errors."""
+    """Empty a trusted cache directory. Returns a list of real errors.
+
+    nginx keeps working on the cache meanwhile: entries the cache manager
+    expires disappear (ENOENT), and new responses can be cached into a hash
+    directory just before it is removed (ENOTEMPTY). Neither is an error --
+    a new entry was produced after the clear started."""
     errors = []
 
     def onexc(func, path, exc):
-        if isinstance(exc, FileNotFoundError):
+        if isinstance(exc, FileNotFoundError) or getattr(exc, "errno", None) == errno.ENOTEMPTY:
             return
         errors.append(f"{path}: {exc}")
 
