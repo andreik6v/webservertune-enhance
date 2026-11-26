@@ -637,15 +637,63 @@ def apply_quic_gso_enable(config, logger):
 # apply_include_features
 # ---------------------------------------------------------------------------
 
+def _docroot_from_conf_lines(lines):
+    """Return the document root from a vhost's `root "...";` directive, or None."""
+    for line in lines:
+        s = line.strip()
+        if s.startswith("root "):
+            val = s[len("root "):].strip().rstrip(";").strip().strip('"').strip("'")
+            return Path(val) if val else None
+    return None
+
+
+def _xmlrpc_block_wanted(lines):
+    """
+    True if this vhost serves WordPress and no Jetpack plugin is installed.
+
+    Checks the docroot and its immediate subdirectories (WordPress installed in a
+    subdirectory), like the WooCommerce detection in nginxcacheexclude. Any plugin
+    directory starting with "jetpack" counts as Jetpack, since the Jetpack
+    connection still relies on xmlrpc.php. Errors default to False, so a site is
+    never blocked when it can't be inspected.
+    """
+    docroot = _docroot_from_conf_lines(lines)
+    if not docroot or not docroot.is_dir():
+        return False
+    candidates = [docroot]
+    try:
+        candidates += [d for d in docroot.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    except Exception:
+        pass
+    is_wp = False
+    for root in candidates:
+        try:
+            if not (root / "wp-load.php").exists():
+                continue
+            is_wp = True
+            plugins = root / "wp-content" / "plugins"
+            if plugins.is_dir() and any(p.is_dir() for p in plugins.glob("jetpack*")):
+                return False
+        except Exception:
+            return False
+    return is_wp
+
+
 def apply_include_features(config, logger):
     """
-    Add or remove managed include directives (ssl, hardening, cms, redirects)
-    from all non-default vhost confs. Inserts after the vhost_includes line,
-    or before the closing brace if that line is absent.
+    Add or remove managed include directives (ssl, hardening, cms, xmlrpc,
+    redirects) from all non-default vhost confs. Inserts after the vhost_includes
+    line, or before the closing brace if that line is absent.
+
+    The xmlrpc include is per vhost: it is added only to WordPress sites without
+    a Jetpack plugin and not listed in xmlrpc_allow_domains.
     """
     features        = config.get("nginx", {}).get("features", {})
     redirects_on    = config.get("general", {}).get("nginx_redirects", False)
     cacheexclude_on = config.get("nginx-cacheexclude", {}).get("enabled", False)
+    xmlrpc_on       = features.get("xmlrpc_protection", False)
+    xmlrpc_allow    = {d.strip().lower() for d in features.get("xmlrpc_allow_domains", []) if d.strip()}
+    xmlrpc_inc      = f"include {OVERRIDES}/xmlrpc.conf"
 
     if cacheexclude_on:
         CACHE_EXCLUDES_DIR.mkdir(parents=True, exist_ok=True)
@@ -657,7 +705,7 @@ def apply_include_features(config, logger):
     }
 
     expected   = [v for k, v in include_map.items() if features.get(k, False)]
-    manageable = list(include_map.values())
+    manageable = list(include_map.values()) + [xmlrpc_inc]
 
     conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
     any_changed = False
@@ -685,7 +733,10 @@ def apply_include_features(config, logger):
             logger.error(f"Failed to read {filename}: {e}")
             continue
 
+        want_xmlrpc     = (xmlrpc_on and cf.stem.lower() not in xmlrpc_allow
+                           and _xmlrpc_block_wanted(lines))
         file_expected   = (expected
+                           + ([xmlrpc_inc] if want_xmlrpc else [])
                            + ([redirect_inc] if redirects_on else [])
                            + ([cacheexc_inc] if cacheexclude_on else []))
         file_manageable = manageable + [redirect_inc, cacheexc_inc]
@@ -755,6 +806,8 @@ def apply_include_features(config, logger):
             parts = []
             if to_add:
                 names = [k for k, v in include_map.items() if v in to_add]
+                if xmlrpc_inc in to_add:
+                    names.append("xmlrpc_protection")
                 if redirect_inc in to_add:
                     names.append("nginx_redirects")
                 if cacheexc_inc in to_add:
@@ -762,6 +815,8 @@ def apply_include_features(config, logger):
                 parts.append(f"added {', '.join(names)}")
             if to_remove:
                 names = [k for k, v in include_map.items() if v in to_remove]
+                if xmlrpc_inc in to_remove:
+                    names.append("xmlrpc_protection")
                 if redirect_inc in to_remove:
                     names.append("nginx_redirects")
                 if cacheexc_inc in to_remove:

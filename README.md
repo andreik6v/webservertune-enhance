@@ -137,6 +137,8 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress protection rules: deny `wp-config*`, readme/license/changelog files, PHP in `wp-content/uploads` (and cache/upgrade/backup dirs) and direct PHP in `wp-includes` (except the TinyMCE loader and `ms-files.php`). `xmlrpc.php` is not blocked, because Jetpack and the mobile apps need it |
 | `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` in `[general]` |
 | `connection_ip_logging` | `false` | Append the TCP peer address (`$realip_remote_addr`) and the Cloudflare Ray ID (`$http_cf_ray`) to the persistent log format, so you can tell requests that came through Cloudflare from direct-to-origin requests and spot spoofed `CF-Connecting-IP` / `X-Forwarded-For` values. Requires `persistent_logging = true` in `[general]` |
+| `xmlrpc_protection` | `false` | Deny `/xmlrpc.php` (include `overrides/xmlrpc.conf`) on WordPress vhosts that have no Jetpack plugin (`wp-content/plugins/jetpack*`). Detection runs like the WooCommerce cache-exclude detection, so a newly installed Jetpack is picked up on the next run (vhost change or service restart) |
+| `xmlrpc_allow_domains` | `[]` | Vhosts (conf file names without `.conf`, e.g. `example.com`) that keep `xmlrpc.php` open even without Jetpack, e.g. for the WordPress mobile app or publishing tools |
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
 | `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |
 | `client_max_body_size` | `200m` | Maximum upload and request body size |
@@ -251,6 +253,7 @@ This fork is upstream [rdbf/webservertune-enhance](https://github.com/rdbf/webse
 
 - `connection_ip_logging` for Nginx persistent logs (upstream PR #4)
 - `cms_protection` fix: deny-only rules, so PHP source is no longer served for allowlisted plugins
+- `xmlrpc_protection`: deny `xmlrpc.php` only on WordPress sites without Jetpack, with an allowlist
 
 Install from this fork with `git clone https://github.com/andreik6v/webservertune-enhance.git /opt/webservertune-enhance`. Upstream changes are merged into `main` here.
 
