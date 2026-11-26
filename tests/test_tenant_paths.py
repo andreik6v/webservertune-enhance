@@ -407,14 +407,14 @@ class FastcgiclearTests(unittest.TestCase):
         other = "99999999-2222-3333-4444-555555555555"
         (sites / "a.conf").write_text(
             "fastcgi_cache_path /c/a levels=1:2 keys_zone=a:10m;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log a; }}\n")
         (sites / "a-preview.conf").write_text(
             "fastcgi_cache_path /c/ap levels=1:2 keys_zone=ap:10m;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log ap;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log ap; }}\n")
         (sites / "b.conf").write_text(
             f"# moved from {UUID}\nroot /var/www/{UUID}/x;\n"
             "fastcgi_cache_path /c/b levels=1:2 keys_zone=b:10m;\n"
-            f"access_log /var/local/enhance/webserver_logs/{other}.log b;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{other}.log b; }}\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/ap"])
         # a vhost removed while scanning (here: dangling) makes the list unreliable
         (sites / "gone.conf").symlink_to(sites / "does-not-exist.conf")
@@ -424,43 +424,54 @@ class FastcgiclearTests(unittest.TestCase):
         # two cache zones on one line are two directives
         (sites / "a.conf").write_text(
             "fastcgi_cache_path /c/a keys_zone=a:1m; fastcgi_cache_path /c/z keys_zone=z:1m;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log a; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
         (sites / "a.conf").write_text(
             "fastcgi_cache_path /c/a levels=1:2 keys_zone=a:10m;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log a; }}\n")
         (sites / "a-preview.conf").write_text(
             "fastcgi_cache_path \"/c/a p\" levels=1:2 keys_zone=ap:10m;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log ap;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log ap; }}\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
         # an alias vhost of the same webspace with caching off has no cache zone
         (sites / "alias.conf").write_text(
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
         # a vhost of the webspace that cannot be parsed makes the list unreliable
         (sites / "alias.conf").write_text(
             "fastcgi_cache_path \"/c/al x levels=1:2;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
         # directive text inside an argument or a comment is not a directive
         (sites / "alias.conf").write_text(
             "add_header X-Doc \"fastcgi_cache_path /c/evil levels=1:2;\";\n"
             "# fastcgi_cache_path /c/old levels=1:2;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
         # a vhost that mentions the webspace's log only in a comment is not the webspace's
         (sites / "alias.conf").write_text(
             "fastcgi_cache_path /c/other levels=1:2;\n"
             f"# access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n"
-            "access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o;\n")
+            "server { access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o; }\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        # rows of a map block are data, not cache zones
+        (sites / "alias.conf").write_text(
+            "map $a $b { fastcgi_cache_path /c/evil; }\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        # a top-level include in a matched vhost could declare more zones
+        (sites / "alias.conf").write_text(
+            "include /etc/nginx/zones.conf;\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
         os.unlink(sites / "alias.conf")
         (sites / "two.conf").write_text(
             "fastcgi_cache_path /c/x levels=1:2 keys_zone=x:10m;\n"
             "fastcgi_cache_path /c/y levels=1:2 keys_zone=y:10m;\n"
-            f"access_log /var/local/enhance/webserver_logs/{UUID}.log x;\n")
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log x; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
 
@@ -473,7 +484,7 @@ class FastcgiclearTests(unittest.TestCase):
         with self.assertRaises(fcc.UnsafePath):        # no vhost names the webspace
             fcc.find_cache_paths(UUID)
         (sites / "x.conf").write_text(
-            "access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log x;\n")
+            "server { access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log x; }\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
 
@@ -525,7 +536,7 @@ class FastcgiclearTests(unittest.TestCase):
         croot.mkdir()
         os.chmod(croot, 0o755)
         self._with(SITES_DIR=sites, TRUSTED_CACHE_ROOT=croot)
-        log = f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n"
+        log = f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log a; }}\n"
         (sites / "a.conf").write_text(f"fastcgi_cache_path {croot}/a.eu keys_zone=a:1m;\n" + log)
         (sites / "b.conf").write_text(f"fastcgi_cache_path {croot}/b.eu keys_zone=b:1m;\n" + log)
         (croot / "a.eu" / "1" / "aa").mkdir(parents=True)
@@ -573,7 +584,7 @@ class FastcgiclearTests(unittest.TestCase):
         os.chmod(croot, 0o755)
         self._with(SITES_DIR=sites, TRUSTED_CACHE_ROOT=croot)
         (sites / "a.conf").write_text(f"fastcgi_cache_path {croot}/a.eu keys_zone=a:1m;\n"
-                                      f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
+                                      f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log a; }}\n")
         (croot / "a.eu" / "1").mkdir(parents=True)
         done = set()
         self.assertTrue(fcc.clear_site_cache(UUID, LOG, done))
@@ -964,6 +975,27 @@ class NginxtuneRunPreflightTests(unittest.TestCase):
         ngx.run({}, LOG)
         self.assertEqual(self.calls, ["restore"])
 
+    def test_restored_config_not_reloaded_when_unsafe(self):
+        import logging as _logging
+        exits = []
+        old_exit, old_shutdown = ngx.os._exit, _logging.shutdown
+        ngx.os._exit = lambda code: exits.append(code)
+        _logging.shutdown = lambda: None
+        self.addCleanup(setattr, ngx.os, "_exit", old_exit)
+        self.addCleanup(setattr, _logging, "shutdown", old_shutdown)
+        ngx.NGINX_CONF.write_text("http { access_log /var/log/nginx/access.log; }\n")
+
+        def restore(b, logger):
+            # the "previous" config that comes back has a webspace log
+            ngx.NGINX_CONF.write_text(f"http {{ access_log /var/www/{UUID}/x.log; }}\n")
+            self.calls.append("restore")
+            return True
+        ngx._restore_backup = restore
+        ngx._reload_nginx = lambda logger: self.calls.append("reload") or False
+        ngx.run({}, LOG)
+        self.assertEqual(self.calls, ["test", "reload", "restore"])
+        self.assertEqual(exits, [0])
+
     def test_clean_config_is_tested_and_reloaded(self):
         ngx.NGINX_CONF.write_text("http { access_log /var/log/nginx/access.log; }\n")
         ngx.run({}, LOG)
@@ -983,6 +1015,17 @@ class NginxConfTests(unittest.TestCase):
         self.assertEqual(self.names('if ($a != "") { b; }'), [("if", ["($a", "!=", "", ")"]), ("b", [])])
         self.assertEqual(self.names('a "q\\"uote";'), [("a", ['q"uote'])])
         self.assertEqual(self.names('add_header X "multi\nline";'), [("add_header", ["X", "multi\nline"])])
+        # '}' inside a token is literal; only at token start does it close a block
+        self.assertEqual(self.names("location ~ ^/docs/[}]$ { return 204; }"),
+                         [("location", ["~", "^/docs/[}]$"]), ("return", ["204"])])
+        # after "${" nginx tokenizes normally again
+        self.assertEqual(self.names("set $x ${a}b;"), [("set", ["$x", "${a}b"])])
+        # an escaped newline inside a token still counts as a line
+        self.assertEqual([d.line_start for d in nc.parse("a b\\\nc;\nd;")], [0, 2])
+        # block context
+        ctx = {d.name: d.ctx for d in nc.parse("http { server { location / { x; } } map $a $b { y z; } }")}
+        self.assertEqual(ctx["x"], ("http", "server", "location"))
+        self.assertEqual(ctx["y"], ("http", "map"))
         for bad in ('a "open;', "a {", "}", "a; }", ";", 'a "x"y;', "a"):
             with self.assertRaises(nc.ConfError, msg=bad):
                 nc.parse(bad)
@@ -1017,6 +1060,30 @@ class NginxConfTests(unittest.TestCase):
         problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
         self.assertEqual(len(errors), 1)
         self.assertIn("missing.conf", errors[0])
+
+    def test_symlink_chain_and_relative_includes(self):
+        root = self._tree()
+        www = Path(tempfile.mkdtemp())
+        old = nc.WWW_DIR
+        nc.WWW_DIR = str(www)
+        self.addCleanup(setattr, nc, "WWW_DIR", old)
+        (www / "site").mkdir()
+        outside = Path(tempfile.mkdtemp())
+        # a directory link into the webspace, whose file links back out again
+        (root / "site-logs").symlink_to(www / "site")
+        (www / "site" / "a.log").symlink_to(outside / "a.log")
+        # '..' after a symlink means what the kernel makes of it
+        (root / "deep").symlink_to(www / "site")
+        (root / "conf.d" / "x.conf").write_text("access_log site-logs/a.log; error_log deep/../b.log;\n"
+                                                 f"map $a $b {{ access_log {www}/site/not-a-directive; }}\n")
+        # includes resolve against the main config's directory, not the prefix
+        (root / "nginx.conf").write_text("include conf.d/*.conf;\n")
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(problems), 2, problems)
+        other_prefix = Path(tempfile.mkdtemp())
+        files, errors = nc.include_graph(str(root / "nginx.conf"), prefix=str(other_prefix))
+        self.assertEqual((len(files), errors), (2, []))
 
     def test_symlink_into_webspace_and_variables_detected(self):
         root = self._tree()

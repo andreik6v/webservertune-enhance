@@ -20,8 +20,12 @@ WWW_DIR      = "/var/www"
 
 # name: directive name; args: decoded arguments; start/end: character offsets
 # of the whole directive including its terminator; line_start/line_end:
-# 0-based line numbers; term: ";" or "{"; depth: block nesting level
-Directive = namedtuple("Directive", "name args start end line_start line_end term depth")
+# 0-based line numbers; term: ";" or "{"; depth: block nesting level;
+# ctx: names of the enclosing blocks, outermost first
+Directive = namedtuple("Directive", "name args start end line_start line_end term depth ctx")
+
+# blocks whose rows are data (map entries, mime types ...), not directives
+DATA_BLOCKS = {"map", "geo", "split_clients", "types", "charset_map", "match"}
 
 
 class ConfError(Exception):
@@ -50,7 +54,8 @@ def parse(text):
     directive left open at the end."""
     directives = []
     args, d_start, d_line = [], None, 0
-    depth, line, i, n = 0, 0, 0, len(text)
+    stack = []
+    line, i, n = 0, 0, len(text)
     while i < n:
         ch = text[i]
         if ch == "\n":
@@ -67,18 +72,19 @@ def parse(text):
         if ch in ";{":
             if not args:
                 raise ConfError(f"line {line + 1}: unexpected '{ch}'")
-            directives.append(Directive(args[0], args[1:], d_start, i + 1, d_line, line, ch, depth))
+            directives.append(Directive(args[0], args[1:], d_start, i + 1, d_line, line, ch,
+                                        len(stack), tuple(stack)))
             if ch == "{":
-                depth += 1
+                stack.append(args[0])
             args, d_start = [], None
             i += 1
             continue
         if ch == "}":
             if args:
                 raise ConfError(f"line {line + 1}: unexpected '}}'")
-            if depth == 0:
+            if not stack:
                 raise ConfError(f"line {line + 1}: unexpected '}}'")
-            depth -= 1
+            stack.pop()
             i += 1
             continue
         # a token starts here
@@ -109,52 +115,66 @@ def parse(text):
             if i < n and text[i] not in " \t\r\n;{)":
                 raise ConfError(f"line {line + 1}: unexpected character after quoted string")
             continue
-        j, raw, var = i, [], False
+        # an unquoted token ends at whitespace, ';' or '{' -- not at '}', which
+        # nginx treats as structural only at the start of a token; a '{'
+        # directly after '$' (as in ${var}) does not open a block
+        j, raw = i, []
         while j < n:
             c = text[j]
             if c == "\\" and j + 1 < n:
                 raw.append(text[j:j + 2])
+                if text[j + 1] == "\n":
+                    line += 1
                 j += 2
                 continue
-            if var:
-                raw.append(c)
-                if c == "}":
-                    var = False
-                j += 1
-                continue
             if c == "{" and raw and raw[-1] == "$":
-                var = True
                 raw.append(c)
                 j += 1
                 continue
-            if c in " \t\r\n;{}":
+            if c in " \t\r\n;{":
                 break
             raw.append(c)
             j += 1
         args.append(_unescape("".join(raw)))
         i = j
-    if args or depth:
+    if args or stack:
         raise ConfError("unexpected end of file")
     return directives
 
 
 def _resolve(path, base):
-    return os.path.normpath(path if path.startswith("/") else os.path.join(base, path))
+    """Join like nginx does, without normalising: '..' after a symlink must mean
+    what the kernel makes of it."""
+    return path if path.startswith("/") else os.path.join(base, path)
 
 
-def _below_www(path):
-    real_www = os.path.realpath(WWW_DIR)
-    for p in {os.path.normpath(path), os.path.realpath(path)}:
-        for w in {WWW_DIR, real_www}:
-            if p == w or p.startswith(w + "/"):
-                return True
+def _in_www(p):
+    for w in {WWW_DIR, os.path.realpath(WWW_DIR)}:
+        if p == w or p.startswith(w.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _reaches_www(path):
+    """True if path, or any directory on the way to it, is /var/www or below once
+    symlinks are resolved -- the nginx master opens it as root, so a webspace
+    anywhere along the path is enough for the site user to redirect it."""
+    if _in_www(os.path.normpath(path)):
+        return True
+    cur = ""
+    for comp in path.split("/")[1:]:
+        cur = f"{cur}/{comp}"
+        if _in_www(os.path.realpath(cur)):
+            return True
     return False
 
 
 def include_graph(root, prefix=NGINX_PREFIX):
-    """Yield (file, text, directives) for root and every file it includes,
-    recursively. Literal includes that do not exist and unreadable or unparseable
-    files are reported in the returned error list."""
+    """Return ([(file, text, directives)], errors) for root and every file it
+    includes, recursively. Relative includes resolve against the directory of
+    the main config file, as nginx's conf prefix does. Literal includes that do
+    not exist and unreadable or unparseable files are reported as errors."""
+    conf_base = os.path.dirname(os.path.abspath(root))
     seen, out, errors = set(), [], []
     stack = [root]
     while stack:
@@ -172,9 +192,9 @@ def include_graph(root, prefix=NGINX_PREFIX):
             continue
         out.append((f, text, ds))
         for d in ds:
-            if d.name != "include" or not d.args:
+            if d.name != "include" or not d.args or set(d.ctx) & DATA_BLOCKS:
                 continue
-            pat = _resolve(d.args[0], prefix)
+            pat = _resolve(d.args[0], conf_base)
             if glob.has_magic(pat):
                 stack.extend(sorted(glob.glob(pat), reverse=True))
             elif os.path.exists(pat):
@@ -186,8 +206,10 @@ def include_graph(root, prefix=NGINX_PREFIX):
 
 def is_webspace_log(d, prefix=NGINX_PREFIX):
     """True if d is an access_log/error_log whose destination is /var/www or
-    below, or cannot be judged because it starts with a variable."""
-    if d.name not in ("access_log", "error_log") or not d.args:
+    below (directly, through a symlinked directory or file, or with '..'), or
+    cannot be judged because it starts with a variable. Rows of data blocks
+    such as map are not directives and never count."""
+    if d.name not in ("access_log", "error_log") or not d.args or set(d.ctx) & DATA_BLOCKS:
         return False
     dest = d.args[0]
     if dest == "off" or dest == "stderr" or dest.startswith(("syslog:", "memory:")):
@@ -197,7 +219,7 @@ def is_webspace_log(d, prefix=NGINX_PREFIX):
     path = _resolve(dest.split("$", 1)[0], prefix)
     if "$" in dest:
         path = os.path.dirname(path) or "/"
-    return _below_www(path)
+    return _reaches_www(path)
 
 
 def sole_on_line(text, directives):

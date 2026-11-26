@@ -71,20 +71,27 @@ def _enhance_log_uuid(path):
     return u if _UUID_RE.fullmatch(u) else None
 
 
+def _in_server(d):
+    return "server" in d.ctx and not set(d.ctx) & _nginxconf().DATA_BLOCKS
+
+
 def _is_pers_log(d):
-    return d.name == "access_log" and bool(d.args) and d.args[0].startswith(f"{SITE_LOGS_DIR}/")
+    return (d.name == "access_log" and bool(d.args) and _in_server(d)
+            and d.args[0].startswith(f"{SITE_LOGS_DIR}/"))
 
 
 def _is_pers_fmt(d):
-    return d.name == "log_format" and bool(d.args) and d.args[0].endswith("_persistent")
+    # the vhost file is included at http level, where log_format lives
+    return d.name == "log_format" and bool(d.args) and d.ctx == () and d.args[0].endswith("_persistent")
 
 
 def _is_base_fmt(d):
-    return d.name == "log_format" and bool(d.args) and not d.args[0].endswith("_persistent")
+    return d.name == "log_format" and bool(d.args) and d.ctx == () and not d.args[0].endswith("_persistent")
 
 
 def _is_enhance_log(d):
-    return d.name == "access_log" and bool(d.args) and d.args[0].startswith(ENHANCE_LOG_DIR)
+    return (d.name == "access_log" and bool(d.args) and _in_server(d)
+            and d.args[0].startswith(ENHANCE_LOG_DIR))
 
 
 NGINX_DROPIN  = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
@@ -282,7 +289,14 @@ def run(config, logger):
     else:
         logger.error(f"nginx reload failed — restoring backup and restarting service")
         if _restore_backup(backup_dir, logger):
-            if _reload_nginx(logger):
+            try:
+                problems, errors = _nginxconf().webspace_log_check(str(NGINX_CONF))
+            except Exception as e:
+                problems, errors = [], [str(e)]
+            if problems or errors:
+                logger.error("Not reloading the restored config, log destination check failed: "
+                             + "; ".join((problems + errors)[:5]))
+            elif _reload_nginx(logger):
                 logger.info("Restored config reloaded successfully")
             else:
                 logger.error("Reload of restored config also failed")
@@ -982,7 +996,7 @@ def apply_logging_features(config, logger):
         has_legacy_log = bool(legacy)
 
         sole = nc.sole_on_line(text, ds)
-        relevant = [d for d in ds if d.name == "log_format"
+        relevant = [d for d in ds if _is_base_fmt(d) or _is_pers_fmt(d)
                     or _is_pers_log(d) or _is_enhance_log(d)]
         if any(sole.get(d.line_start) is not d for d in relevant):
             # not editable line by line; still never keep a log inside a webspace

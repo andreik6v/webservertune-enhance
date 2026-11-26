@@ -418,8 +418,8 @@ def find_cache_paths(uuid):
     to uuid. A webspace can have several domains and preview aliases, each with
     at most one cache zone (none when caching is off for it).
 
-    Directives are read with the nginx tokenizer, so comments and argument text
-    never count. Raises UnsafePath whenever the answer could be incomplete or
+    Directives are read with the nginx tokenizer, so comments, argument text and
+    rows of data blocks such as map never count. Raises UnsafePath whenever the answer could be incomplete or
     ambiguous: no vhost names the webspace, a vhost disappears during the scan,
     a matching vhost cannot be parsed or has more than one cache zone.
     """
@@ -442,10 +442,16 @@ def find_cache_paths(uuid):
             if want_log in content:
                 raise UnsafePath(f"{cf.name} cannot be parsed: {e}")
             continue
-        if not any(d.name == "access_log" and d.args[:1] == [want_log] for d in ds):
+        if not any(d.name == "access_log" and d.args[:1] == [want_log]
+                   and "server" in d.ctx and not set(d.ctx) & nc.DATA_BLOCKS for d in ds):
             continue
         matched += 1
-        found = [Path(d.args[0]) for d in ds if d.name == "fastcgi_cache_path" and d.args]
+        # the vhost file is included at http level: cache zones are its top-level
+        # fastcgi_cache_path directives; a top-level include could declare more
+        if any(d.name == "include" and d.ctx == () for d in ds):
+            raise UnsafePath(f"{cf.name} includes other files at http level")
+        found = [Path(d.args[0]) for d in ds
+                 if d.name == "fastcgi_cache_path" and d.args and d.ctx == ()]
         if len(found) > 1:
             raise UnsafePath(f"{cf.name} has {len(found)} fastcgi_cache_path directives")
         paths.extend(found)
