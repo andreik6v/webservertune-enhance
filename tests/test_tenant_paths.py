@@ -412,9 +412,21 @@ class FastcgiclearTests(unittest.TestCase):
             f"# moved from {UUID}\nroot /var/www/{UUID}/x;\n"
             "fastcgi_cache_path /c/b levels=1:2 keys_zone=b:10m;\n"
             f"access_log /var/local/enhance/webserver_logs/{other}.log b;\n")
-        # a vhost removed while scanning (here: dangling) is skipped
-        (sites / "gone.conf").symlink_to(sites / "does-not-exist.conf")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/ap"])
+        # a vhost removed while scanning (here: dangling) makes the list unreliable
+        (sites / "gone.conf").symlink_to(sites / "does-not-exist.conf")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "gone.conf")
+        # two cache zones on one line are two directives
+        (sites / "a.conf").write_text(
+            "fastcgi_cache_path /c/a keys_zone=a:1m; fastcgi_cache_path /c/z keys_zone=z:1m;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        (sites / "a.conf").write_text(
+            "fastcgi_cache_path /c/a levels=1:2 keys_zone=a:10m;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
         (sites / "a-preview.conf").write_text(
             "fastcgi_cache_path \"/c/a p\" levels=1:2 keys_zone=ap:10m;\n"
             f"access_log /var/local/enhance/webserver_logs/{UUID}.log ap;\n")
@@ -456,14 +468,42 @@ class FastcgiclearTests(unittest.TestCase):
         try:
             fcc.shutil.rmtree = fake(FileNotFoundError)
             self.assertEqual(fcc.clear_cache_dir(c), [])
+            # a response cached into a hash dir during the clear may be stale: error
             (c / "3").mkdir()
             fcc.shutil.rmtree = fake(lambda e, m, p: OSError(errno.ENOTEMPTY, m, p))
-            self.assertEqual(fcc.clear_cache_dir(c), [])
+            self.assertEqual(len(fcc.clear_cache_dir(c)), 1)
             (c / "2").mkdir()
             fcc.shutil.rmtree = fake(PermissionError)
             self.assertEqual(len(fcc.clear_cache_dir(c)), 1)
         finally:
             fcc.shutil.rmtree = real
+
+    def test_clear_site_cache(self):
+        sites = self.tmp / "sites-enabled"
+        sites.mkdir()
+        croot = self.tmp / "nginx_cache"
+        croot.mkdir()
+        os.chmod(croot, 0o755)
+        self._with(SITES_DIR=sites, TRUSTED_CACHE_ROOT=croot)
+        log = f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n"
+        (sites / "a.conf").write_text(f"fastcgi_cache_path {croot}/a.eu keys_zone=a:1m;\n" + log)
+        (sites / "b.conf").write_text(f"fastcgi_cache_path {croot}/b.eu keys_zone=b:1m;\n" + log)
+        (croot / "a.eu" / "1" / "aa").mkdir(parents=True)
+        (croot / "a.eu" / "1" / "aa" / "k").write_text("x")
+        # b.eu not created yet: nothing cached, still a complete clear
+        self.assertTrue(fcc.clear_site_cache(UUID, LOG))
+        self.assertEqual(os.listdir(croot / "a.eu"), [])
+        # a cache path outside the trusted root is a failure, nothing deleted there
+        (self.tmp / "other").mkdir()
+        (self.tmp / "other" / "keep").write_text("x")
+        (sites / "b.conf").write_text(f"fastcgi_cache_path {self.tmp}/other keys_zone=b:1m;\n" + log)
+        self.assertFalse(fcc.clear_site_cache(UUID, LOG))
+        self.assertTrue((self.tmp / "other" / "keep").exists())
+        # a symlinked cache dir below the root is a failure, its target untouched
+        (sites / "b.conf").write_text(f"fastcgi_cache_path {croot}/b.eu keys_zone=b:1m;\n" + log)
+        (croot / "b.eu").symlink_to(self.v.dir)
+        self.assertFalse(fcc.clear_site_cache(UUID, LOG))
+        self.v.assert_untouched(self)
 
     def test_clear_cache_dir_reports_failures(self):
         if AS_ROOT:
@@ -771,6 +811,18 @@ class NginxtuneMigrationTests(unittest.TestCase):
         text = self.settle(self.cfg(True))
         self.assertNotIn("_persistent", text)
         self.assertFalse((self.tmp / "elsewhere.log").exists())
+
+    def test_format_inserted_only_after_the_real_log_format(self):
+        # text "log_format" inside another directive must not be taken for one
+        c = 'server {\nlisten 81;\nadd_header X-Note "log_format here";\n}\n' + VHOST.replace(
+            '\\"$msec\\"";', '\\"$msec\\""; # main')
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(True))
+        lines = text.splitlines()
+        i = next(n for n, l in enumerate(lines) if l.startswith("log_format example.com "))
+        self.assertTrue(lines[i + 1].startswith("log_format example.com_persistent "), lines[i:i + 2])
+        self.assertEqual(text.count("_persistent '"), 1)
+        self.assertIn('add_header X-Note "log_format here";\n}', text)
 
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code

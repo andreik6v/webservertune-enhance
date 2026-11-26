@@ -75,6 +75,25 @@ def _code_part(line):
     return q is None, line
 
 
+def _tokens(s):
+    """Whitespace tokens of a stripped line; directives are recognised only by
+    their first token, never by text appearing elsewhere on the line."""
+    return s.split()
+
+
+def _is_pers_fmt(t):
+    return len(t) >= 2 and t[0] == "log_format" and t[1].endswith("_persistent")
+
+
+def _is_base_fmt(t):
+    return len(t) >= 2 and t[0] == "log_format" and not t[1].endswith("_persistent")
+
+
+def _is_enhance_log(t):
+    return (len(t) >= 3 and t[0] == "access_log"
+            and t[1].startswith("/var/local/enhance/webserver_logs/"))
+
+
 def _enhance_log_uuid(s):
     """UUID from an Enhance `access_log /var/local/enhance/webserver_logs/<uuid>.log fmt;` line."""
     parts = s.split()
@@ -987,27 +1006,28 @@ def apply_logging_features(config, logger):
         uuid            = None
         enh_logs        = 0       # Enhance access_log lines for that uuid
         base_fmt        = None
+        base_fmt_idx    = None    # line the persistent format is inserted after
         fmts_single     = True    # every log_format is one complete line
 
-        for line in lines:
+        for i, line in enumerate(lines):
             s = line.strip()
             if s.startswith("#"):
                 continue
-            if s.startswith("log_format") and not _code_part(s)[1].rstrip().endswith(";"):
+            t = _tokens(s)
+            if t[:1] == ["log_format"] and not _code_part(s)[1].rstrip().endswith(";"):
                 fmts_single = False
             if _is_current_pers_log_line(s):
                 pers_logs.append(s)
-            elif "log_format" in s and "_persistent" in s:
+            elif _is_pers_fmt(t):
                 n_pers_fmt += 1
-            elif "map $http_cf_connecting_ip $actual_addr" in s:
+            elif s.startswith("map $http_cf_connecting_ip $actual_addr"):
                 has_realip_map = True
-            elif "log_format" in s:
+            elif _is_base_fmt(t):
                 if "$actual_addr" in s:
                     has_realip_fmt = True
-                parts = s.split()
-                if base_fmt is None and len(parts) >= 2 and parts[0] == "log_format":
-                    base_fmt = parts[1]
-            elif "access_log /var/local/enhance/webserver_logs/" in s:
+                if base_fmt is None:
+                    base_fmt, base_fmt_idx = t[1], i
+            elif _is_enhance_log(t):
                 u = _enhance_log_uuid(s)
                 if uuid is None:
                     uuid = u
@@ -1035,7 +1055,7 @@ def apply_logging_features(config, logger):
             expected = _persistent_log_format(base_fmt, ip_var, conn_ip_on).strip()
             for line in lines:
                 s = line.strip()
-                if not s.startswith("#") and "log_format" in s and "_persistent" in s:
+                if not s.startswith("#") and _is_pers_fmt(_tokens(s)):
                     if s != expected:
                         pers_fmt_correct = False
                     break
@@ -1064,13 +1084,14 @@ def apply_logging_features(config, logger):
 
         for i, line in enumerate(lines):
             s    = line.strip()
+            t    = _tokens(s)
             base = _indent(lines, i)
 
             if s.startswith("#"):
                 new_lines.append(line)      # comments are never interpreted or changed
                 continue
 
-            elif not realip_on and "map $http_cf_connecting_ip $actual_addr" in s:
+            elif not realip_on and s.startswith("map $http_cf_connecting_ip $actual_addr"):
                 continue
 
             # always strip the persistent log line — re-added below to prevent duplicates
@@ -1078,10 +1099,10 @@ def apply_logging_features(config, logger):
                 continue
 
             # always strip the persistent format — re-added below with correct ip_var
-            elif "log_format" in s and "_persistent" in s:
+            elif _is_pers_fmt(t):
                 continue
 
-            elif "log_format" in s and "_persistent" not in s:
+            elif _is_base_fmt(t):
                 if realip_on and "$remote_addr" in s:
                     new_lines.append(line.replace("$remote_addr", "$actual_addr"))
                 elif not realip_on and "$actual_addr" in s:
@@ -1089,7 +1110,7 @@ def apply_logging_features(config, logger):
                 else:
                     new_lines.append(line)
 
-                if want and not pers_fmt_added:
+                if want and i == base_fmt_idx:
                     new_lines.append(_persistent_log_format(base_fmt, ip_var, conn_ip_on))
                     pers_fmt_added = True
                 continue
@@ -1104,8 +1125,7 @@ def apply_logging_features(config, logger):
                 realip_added = True
                 continue
 
-            elif ("access_log /var/local/enhance/webserver_logs/" in s
-                  and want and _enhance_log_uuid(s) == uuid):
+            elif _is_enhance_log(t) and want and _enhance_log_uuid(s) == uuid:
                 new_lines.append(line)
                 new_lines.append(f"{base}{expected_log}\n")
                 pers_added += 1
@@ -1458,10 +1478,8 @@ def _extract_uuid_from_conf(cf):
     try:
         for line in cf.read_text().splitlines():
             s = line.strip()
-            if "access_log /var/local/enhance/webserver_logs/" in s:
-                parts = s.split()
-                if len(parts) >= 2:
-                    return parts[1].split("/")[-1].replace(".log", "")
+            if not s.startswith("#") and _is_enhance_log(_tokens(s)):
+                return _enhance_log_uuid(s)
     except Exception:
         pass
     return None

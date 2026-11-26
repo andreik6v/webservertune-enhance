@@ -31,7 +31,7 @@ UUID_RE = re.compile(
     re.IGNORECASE
 )
 
-_CACHE_PATH_RE = re.compile(r'''fastcgi_cache_path\s+(?:"([^"]+)"|'([^']+)'|([^\s"';]+))''')
+_CACHE_PATH_RE = re.compile(r'''(?<![\w$])fastcgi_cache_path\s+(?:"([^"]+)"|'([^']+)'|([^\s"';]+))''')
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +71,8 @@ WALK_MAX_ENTRIES = 500000   # directory entries examined in total
 
 # FastCGI cache directories are only ever deleted below this root-owned path.
 TRUSTED_CACHE_ROOT = Path("/var/nginx_cache")
+CLEAR_ATTEMPTS   = 3
+CLEAR_RETRY_SECS = 1
 
 
 class UnsafePath(Exception):
@@ -400,13 +402,16 @@ def find_cache_paths(uuid):
         try:
             content = cf.read_text()
         except FileNotFoundError:
-            continue                    # vhost removed meanwhile
+            # removed or being regenerated: nginx may still serve it, so the
+            # list would be incomplete -- let the caller retry
+            raise UnsafePath(f"{cf.name} disappeared while scanning")
         if not log_re.search(content):
             continue
         found = []
         for line in content.splitlines():
-            m = _CACHE_PATH_RE.match(line.strip())
-            if m:
+            if line.strip().startswith("#"):
+                continue
+            for m in _CACHE_PATH_RE.finditer(line):
                 found.append(Path(next(g for g in m.groups() if g)))
         # Enhance writes one vhost file per domain with exactly one cache zone;
         # anything else is ambiguous, and nothing is cleared rather than guessed
@@ -417,16 +422,16 @@ def find_cache_paths(uuid):
 
 
 def clear_cache_dir(cache_dir):
-    """Empty a trusted cache directory. Returns a list of real errors.
+    """Empty a trusted cache directory. Returns a list of errors.
 
-    nginx keeps working on the cache meanwhile: entries the cache manager
-    expires disappear (ENOENT), and new responses can be cached into a hash
-    directory just before it is removed (ENOTEMPTY). Neither is an error --
-    a new entry was produced after the clear started."""
+    nginx keeps working on the cache meanwhile. Entries its cache manager
+    expires disappear (ENOENT), which is fine. A response can also be cached
+    into a hash directory just before it is removed (ENOTEMPTY); that entry
+    may predate the content change, so it is an error and the caller retries."""
     errors = []
 
     def onexc(func, path, exc):
-        if isinstance(exc, FileNotFoundError) or getattr(exc, "errno", None) == errno.ENOTEMPTY:
+        if isinstance(exc, FileNotFoundError):
             return
         errors.append(f"{path}: {exc}")
 
@@ -452,6 +457,44 @@ def clear_cache_dir(cache_dir):
         except OSError as e:
             errors.append(f"{entry.path}: {e}")
     return errors
+
+
+def clear_site_cache(uuid, logger):
+    """One attempt at emptying every cache dir of the webspace. True only if all
+    of them are known and were emptied completely (or do not exist yet)."""
+    try:
+        cache_paths = find_cache_paths(uuid)
+    except Exception as e:
+        logger.error(f"[{uuid}] Cannot determine cache paths: {e}")
+        return False
+    ok = True
+    for cache_dir in cache_paths:
+        if cache_dir.parent != TRUSTED_CACHE_ROOT:
+            logger.warning(f"[{uuid}] Not clearing {cache_dir}: not directly below "
+                           f"{TRUSTED_CACHE_ROOT}")
+            ok = False
+            continue
+        try:
+            os.lstat(cache_dir)
+        except FileNotFoundError:
+            continue            # nothing cached yet
+        except OSError as e:
+            logger.error(f"[{uuid}] Cannot check {cache_dir}: {e}")
+            ok = False
+            continue
+        if not cache_dir_is_trusted(cache_dir):
+            logger.warning(f"[{uuid}] Not clearing {cache_dir}: not a real directory "
+                           f"directly below {TRUSTED_CACHE_ROOT}")
+            ok = False
+            continue
+        errors = clear_cache_dir(cache_dir)
+        if errors:
+            ok = False
+            logger.warning(f"[{uuid}] Cache dir {cache_dir} only partly cleared "
+                           f"({len(errors)} errors, first: {errors[0]})")
+        else:
+            logger.info(f"[{uuid}] Cleared cache dir {cache_dir}")
+    return ok
 
 
 def _is_real_dir(path):
@@ -566,59 +609,20 @@ def watch(config, logger):
     # Cache clearing
     # ---------------------------------------------------------------------------
 
-    def _find_cache_paths(uuid):
-        """List of cache dirs, or None when they cannot be determined safely."""
-        try:
-            return find_cache_paths(uuid)
-        except Exception as e:
-            logger.error(f"[{uuid}] Cannot determine cache paths: {e}")
-            return None
-
     def _do_clear(uuid):
-        """
-        Clear FastCGI cache for all domains in the webspace by removing
-        cached files directly from the filesystem, then reset the flag file.
-        """
+        """Clear the FastCGI cache of every domain of the webspace, then reset the
+        flag. Retried a few times because nginx keeps using the cache meanwhile;
+        the flag is only reset after a complete clear."""
         logger.info(f"[{uuid}] Clearing FastCGI cache")
-
-        cache_paths = _find_cache_paths(uuid)
-        if cache_paths is None:
-            logger.error(f"[{uuid}] Leaving {FLAG_FILE} as cache=stale")
-            return
-        if not cache_paths:
-            logger.debug(f"[{uuid}] No cache paths found, skipping")
-            return
-
-        failed = False
-        for cache_dir in cache_paths:
-            if cache_dir.parent != TRUSTED_CACHE_ROOT:
-                logger.warning(f"[{uuid}] Not clearing {cache_dir}: not directly below "
-                               f"{TRUSTED_CACHE_ROOT}")
-                failed = True
-                continue
-            try:
-                os.lstat(cache_dir)
-            except FileNotFoundError:
-                continue            # nothing cached yet
-            except OSError as e:
-                logger.error(f"[{uuid}] Cannot check {cache_dir}: {e}")
-                failed = True
-                continue
-            if not cache_dir_is_trusted(cache_dir):
-                logger.warning(f"[{uuid}] Not clearing {cache_dir}: not a real directory "
-                               f"directly below {TRUSTED_CACHE_ROOT}")
-                failed = True
-                continue
-            errors = clear_cache_dir(cache_dir)
-            if errors:
-                failed = True
-                logger.error(f"[{uuid}] Cache dir {cache_dir} only partly cleared "
-                             f"({len(errors)} errors, first: {errors[0]})")
-            else:
-                logger.info(f"[{uuid}] Cleared cache dir {cache_dir}")
-
-        if failed:
-            logger.error(f"[{uuid}] Leaving {FLAG_FILE} as cache=stale (retried on the next flag write or service restart)")
+        for attempt in range(1, CLEAR_ATTEMPTS + 1):
+            if clear_site_cache(uuid, logger):
+                break
+            if attempt < CLEAR_ATTEMPTS:
+                time.sleep(CLEAR_RETRY_SECS)
+        else:
+            logger.error(f"[{uuid}] Cache not completely cleared after {CLEAR_ATTEMPTS} attempts; "
+                         f"leaving {FLAG_FILE} as cache=stale (retried on the next flag write "
+                         "or service restart)")
             return
         try:
             write_flag_cleared(uuid)
