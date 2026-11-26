@@ -49,6 +49,7 @@ def load(name):
 
 
 fcc = load("fastcgiclear")
+nc  = load("nginxconf")
 ngx = load("nginxtune")
 LOG = logging.getLogger("test")
 LOG.addHandler(logging.NullHandler())
@@ -437,17 +438,42 @@ class FastcgiclearTests(unittest.TestCase):
         (sites / "alias.conf").write_text(
             f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
-        # a directive that cannot be parsed is not silently truncated
+        # a vhost of the webspace that cannot be parsed makes the list unreliable
         (sites / "alias.conf").write_text(
-            "fastcgi_cache_path /c/al\"x levels=1:2;\n"
+            "fastcgi_cache_path \"/c/al x levels=1:2;\n"
             f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
+        # directive text inside an argument or a comment is not a directive
+        (sites / "alias.conf").write_text(
+            "add_header X-Doc \"fastcgi_cache_path /c/evil levels=1:2;\";\n"
+            "# fastcgi_cache_path /c/old levels=1:2;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        # a vhost that mentions the webspace's log only in a comment is not the webspace's
+        (sites / "alias.conf").write_text(
+            "fastcgi_cache_path /c/other levels=1:2;\n"
+            f"# access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n"
+            "access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o;\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
         os.unlink(sites / "alias.conf")
         (sites / "two.conf").write_text(
             "fastcgi_cache_path /c/x levels=1:2 keys_zone=x:10m;\n"
             "fastcgi_cache_path /c/y levels=1:2 keys_zone=y:10m;\n"
             f"access_log /var/local/enhance/webserver_logs/{UUID}.log x;\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+
+    def test_find_cache_paths_needs_a_vhost(self):
+        sites = self.tmp / "sites-enabled"
+        self._with(SITES_DIR=sites)
+        with self.assertRaises(fcc.UnsafePath):        # missing directory
+            fcc.find_cache_paths(UUID)
+        sites.mkdir()
+        with self.assertRaises(fcc.UnsafePath):        # no vhost names the webspace
+            fcc.find_cache_paths(UUID)
+        (sites / "x.conf").write_text(
+            "access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log x;\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
 
@@ -747,8 +773,10 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertIn('\n    "', ml)
         self.conf.write_text(ml)
         text = self.settle(self.cfg(True))
-        self.assertNotIn("_persistent", text)
-        self.assertIn('\n    "', text)
+        # the webspace log is still removed, nothing else is touched
+        self.assertNotRegex(text, r"access_log\s+/var/www")
+        self.assertEqual(text, ml.replace(
+            f"access_log /var/www/{UUID}/logs/webserver.log example.com_persistent;\n", ""))
 
     def test_every_enhance_log_gets_its_persistent_line(self):
         two = VHOST.replace("include vhost_includes/example.com.conf;\n}\n",
@@ -795,12 +823,19 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
         self.assertNotIn("old_persistent", text)
 
-    def test_multiline_quoted_string_file_left_untouched(self):
+    def test_multiline_quoted_string_kept(self):
         ml = VHOST.replace("listen 80;", 'listen 80;\nadd_header X-Note "line one;\nline two";')
         self.conf.write_text(ml)
+        text = self.settle(self.cfg(True))
+        self.assertIn('add_header X-Note "line one;\nline two";', text)
+        self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
+
+    def test_unparseable_file_left_untouched(self):
+        bad = VHOST.replace("listen 80;", 'listen 80;\nadd_header X-Note "never closed;')
+        self.conf.write_text(bad)
         for pers in (True, False):
             self.assertFalse(ngx.apply_logging_features(self.cfg(pers), LOG))
-            self.assertEqual(self.conf.read_text(), ml)
+            self.assertEqual(self.conf.read_text(), bad)
 
     def test_mid_word_quote_is_not_a_string(self):
         c = VHOST.replace("listen 80;", "listen 80;\nrewrite ^/don't-go$ /go permanent;\nlocation /a#b { return 204; }")
@@ -845,10 +880,123 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertEqual(text.count("_persistent '"), 1)
         self.assertIn('add_header X-Note "log_format here";\n}', text)
 
+    def test_quoted_persistent_format_name_replaced_not_duplicated(self):
+        text = self.settle(self.cfg(True))
+        self.conf.write_text(text.replace("log_format example.com_persistent ",
+                                          'log_format "example.com_persistent" '))
+        text = self.settle(self.cfg(True))
+        self.assertEqual(text.count("example.com_persistent '"), 1)
+        self.assertNotIn('"example.com_persistent"', text)
+
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code
         ngx.apply_logging_features(self.cfg(True), LOG)
         self.assertFalse(Path(f"/var/www/{UUID}").exists())
+
+
+class NginxtuneRunPreflightTests(unittest.TestCase):
+    """run() must not call nginx -t (which opens every log as root) when any
+    log destination in the include graph points into a webspace."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.saved = {k: getattr(ngx, k) for k in (
+            "NGINX_CONF", "_create_backup", "_restore_backup", "_cleanup_backup",
+            "_cleanup_old_backups", "_test_nginx", "_reload_nginx", "apply_nginx_conf",
+            "apply_http3_enable", "apply_quic_gso_enable", "_apply_cache_excludes",
+            "apply_include_features", "apply_logging_features", "apply_fastcgi_cache_settings",
+            "apply_client_max_body_size")}
+        self.addCleanup(lambda: [setattr(ngx, k, v) for k, v in self.saved.items()])
+        self.calls = []
+        ngx.NGINX_CONF = self.tmp / "nginx.conf"
+        ngx._create_backup = lambda logger: self.tmp
+        ngx._restore_backup = lambda b, logger: self.calls.append("restore") or True
+        ngx._cleanup_backup = lambda b, logger: None
+        ngx._cleanup_old_backups = lambda days, logger: None
+        ngx._test_nginx = lambda: (self.calls.append("test") or (True, ""))
+        ngx._reload_nginx = lambda logger: self.calls.append("reload") or True
+        for k in ("apply_nginx_conf", "apply_http3_enable", "apply_quic_gso_enable",
+                  "_apply_cache_excludes", "apply_include_features", "apply_fastcgi_cache_settings",
+                  "apply_client_max_body_size"):
+            setattr(ngx, k, lambda config, logger: False)
+        ngx.apply_logging_features = lambda config, logger: True
+
+    def test_webspace_log_blocks_nginx_test(self):
+        ngx.NGINX_CONF.write_text(f"http {{ access_log /var/www/{UUID}/x.log; }}\n")
+        ngx.run({}, LOG)
+        self.assertEqual(self.calls, ["restore"])
+
+    def test_clean_config_is_tested_and_reloaded(self):
+        ngx.NGINX_CONF.write_text("http { access_log /var/log/nginx/access.log; }\n")
+        ngx.run({}, LOG)
+        self.assertEqual(self.calls, ["test", "reload"])
+
+
+class NginxConfTests(unittest.TestCase):
+    def names(self, text):
+        return [(d.name, d.args) for d in nc.parse(text)]
+
+    def test_tokenizer_like_nginx(self):
+        self.assertEqual(self.names('a "b c" \'d\';'), [("a", ["b c", "d"])])
+        self.assertEqual(self.names("rewrite ^/don't$ /x; # c ; d;\nlocation /a#b { e f; }"),
+                         [("rewrite", ["^/don't$", "/x"]), ("location", ["/a#b"]), ("e", ["f"])])
+        self.assertEqual(self.names('set $x "${host}a"; return 200 ${y}z;'),
+                         [("set", ["$x", "${host}a"]), ("return", ["200", "${y}z"])])
+        self.assertEqual(self.names('if ($a != "") { b; }'), [("if", ["($a", "!=", "", ")"]), ("b", [])])
+        self.assertEqual(self.names('a "q\\"uote";'), [("a", ['q"uote'])])
+        self.assertEqual(self.names('add_header X "multi\nline";'), [("add_header", ["X", "multi\nline"])])
+        for bad in ('a "open;', "a {", "}", "a; }", ";", 'a "x"y;', "a"):
+            with self.assertRaises(nc.ConfError, msg=bad):
+                nc.parse(bad)
+
+    def test_sole_on_line_and_remove(self):
+        t = "a 1;\n  b 2; # note\nc 3; d 4;\ne {\nf 5; }\ng\n  6;\n"
+        ds = nc.parse(t)
+        sole = nc.sole_on_line(t, ds)
+        self.assertEqual(sorted((ln, d.name) for ln, d in sole.items()), [(0, "a"), (1, "b")])
+        out = nc.remove_directives(t, [d for d in ds if d.name in ("a", "c", "f", "g")])
+        self.assertEqual(out, "  b 2; # note\n d 4;\ne {\n }\n")
+
+    def _tree(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "conf.d").mkdir()
+        return root
+
+    def test_include_graph_and_webspace_logs(self):
+        root = self._tree()
+        (root / "nginx.conf").write_text("http { include conf.d/*.conf; include extra.conf; }\n")
+        (root / "extra.conf").write_text("access_log /var/log/nginx/a.log;\n")
+        (root / "conf.d" / "a.conf").write_text(
+            "server { location /a#b { access_log /var/www/x/y.log; } }\n")
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("/var/www/x/y.log", problems[0])
+
+    def test_missing_literal_include_is_an_error(self):
+        root = self._tree()
+        (root / "nginx.conf").write_text("include missing.conf; include conf.d/none-*.conf;\n")
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing.conf", errors[0])
+
+    def test_symlink_into_webspace_and_variables_detected(self):
+        root = self._tree()
+        www = Path(tempfile.mkdtemp())
+        old = nc.WWW_DIR
+        nc.WWW_DIR = str(www)
+        self.addCleanup(setattr, nc, "WWW_DIR", old)
+        (www / "site").mkdir()
+        (root / "logs").symlink_to(www / "site")
+        (root / "nginx.conf").write_text(
+            "access_log logs/a.log;\n"                     # relative, through a symlink
+            "error_log $var/b.log;\n"                      # cannot be judged
+            f"access_log {www}/site/$host.log;\n"          # variable inside the webspace
+            "access_log off; error_log stderr; access_log syslog:server=x;\n"
+            f"access_log {root}/fine.log;\n")
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(problems), 3, problems)
 
 
 if __name__ == "__main__":

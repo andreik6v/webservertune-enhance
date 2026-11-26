@@ -31,8 +31,6 @@ UUID_RE = re.compile(
     re.IGNORECASE
 )
 
-_CACHE_PATH_RE = re.compile(r'''(?<![\w$])fastcgi_cache_path\s+(?:"([^"]+)"|'([^']+)'|([^\s"';]+))(?=\s|;|$)''')
-_CACHE_DIRECTIVE_RE = re.compile(r'(?<![\w$])fastcgi_cache_path(?=\s|;|$)')
 
 
 # ---------------------------------------------------------------------------
@@ -396,37 +394,62 @@ def deploy_mu_plugin(uuid, plugin_bytes):
     return results, note
 
 
+_nginxconf_mod = None
+
+
+def _nginxconf():
+    """The shared nginx config reader (modules/nginxconf), loaded once."""
+    global _nginxconf_mod
+    if _nginxconf_mod is None:
+        from importlib.machinery import SourceFileLoader
+        import importlib.util
+        path   = Path(__file__).resolve().parent / "nginxconf"
+        loader = SourceFileLoader("nginxconf", str(path))
+        spec   = importlib.util.spec_from_loader("nginxconf", loader)
+        mod    = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _nginxconf_mod = mod
+    return _nginxconf_mod
+
+
 def find_cache_paths(uuid):
-    """FastCGI cache directories of every vhost whose Enhance access_log belongs to uuid.
-    A webspace can have several domains (and preview aliases), each with its own cache."""
-    log_re = re.compile(r'(?m)^\s*access_log\s+/var/local/enhance/webserver_logs/'
-                        + re.escape(uuid) + r'\.log[\s;]')
-    paths = []
+    """FastCGI cache directories of every vhost whose Enhance access_log belongs
+    to uuid. A webspace can have several domains and preview aliases, each with
+    at most one cache zone (none when caching is off for it).
+
+    Directives are read with the nginx tokenizer, so comments and argument text
+    never count. Raises UnsafePath whenever the answer could be incomplete or
+    ambiguous: no vhost names the webspace, a vhost disappears during the scan,
+    a matching vhost cannot be parsed or has more than one cache zone.
+    """
+    nc       = _nginxconf()
+    want_log = f"/var/local/enhance/webserver_logs/{uuid}.log"
+    if not SITES_DIR.is_dir():
+        raise UnsafePath(f"{SITES_DIR} is not a directory")
+    paths, matched = [], 0
     for cf in sorted(SITES_DIR.glob("*.conf")):
         if cf.name.startswith("000-"):
             continue
         try:
             content = cf.read_text()
         except FileNotFoundError:
-            # removed or being regenerated: nginx may still serve it, so the
-            # list would be incomplete -- let the caller retry
+            # removed or being regenerated: nginx may still serve it
             raise UnsafePath(f"{cf.name} disappeared while scanning")
-        if not log_re.search(content):
+        try:
+            ds = nc.parse(content)
+        except nc.ConfError as e:
+            if want_log in content:
+                raise UnsafePath(f"{cf.name} cannot be parsed: {e}")
             continue
-        found = []
-        for line in content.splitlines():
-            if line.strip().startswith("#"):
-                continue
-            parsed = [Path(next(g for g in m.groups() if g)) for m in _CACHE_PATH_RE.finditer(line)]
-            if len(parsed) != len(_CACHE_DIRECTIVE_RE.findall(line)):
-                raise UnsafePath(f"{cf.name} has a fastcgi_cache_path that cannot be parsed")
-            found.extend(parsed)
-        # Enhance writes one vhost file per domain with at most one cache zone
-        # (none when caching is off for it); more is ambiguous, so nothing is
-        # cleared rather than guessed
+        if not any(d.name == "access_log" and d.args[:1] == [want_log] for d in ds):
+            continue
+        matched += 1
+        found = [Path(d.args[0]) for d in ds if d.name == "fastcgi_cache_path" and d.args]
         if len(found) > 1:
             raise UnsafePath(f"{cf.name} has {len(found)} fastcgi_cache_path directives")
         paths.extend(found)
+    if matched == 0:
+        raise UnsafePath("no vhost names this webspace")
     return paths
 
 

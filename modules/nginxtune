@@ -37,93 +37,54 @@ SITE_LOGS_GROUP = "adm"   # readable by log shippers in the adm group (e.g. Vect
 _UUID_RE        = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)  # use fullmatch
 DEFAULT_WORKER_USER = "www-data"
 
-# Any access_log directive writing below /var/www (quoted or not, any whitespace,
-# spanning lines). Removed from every vhost: the nginx master would open it as root.
-# Comments are matched first and kept as they are, so a commented-out line without
-# a ';' can never make the match run into the following directives.
-_WEBSPACE_LOG_RE = re.compile(
-    r'(#[^\n]*|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\')'
-    r'|^[ \t]*access_log\s+["\']?/var/www/[^;#]*;[ \t]*(?:\r?\n)?'
-    r'|(?<![\w$])access_log\s+["\']?/var/www/[^;#]*;',
-    re.MULTILINE)
+ENHANCE_LOG_DIR = "/var/local/enhance/webserver_logs/"
+_FMT_NAME_RE    = re.compile(r'[A-Za-z0-9_.-]+')
+
+_nginxconf_mod = None
+
+
+def _nginxconf():
+    """The shared nginx config reader (modules/nginxconf), loaded once."""
+    global _nginxconf_mod
+    if _nginxconf_mod is None:
+        path   = Path(__file__).resolve().parent / "nginxconf"
+        loader = SourceFileLoader("nginxconf", str(path))
+        spec   = importlib.util.spec_from_loader("nginxconf", loader)
+        mod    = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _nginxconf_mod = mod
+    return _nginxconf_mod
 
 
 def _site_log_path(uuid, name):
     return SITE_LOGS_DIR / uuid / name
 
 
-def _is_current_pers_log_line(s):
-    return s.startswith(f"access_log {SITE_LOGS_DIR}/") and "/webserver.log " in s
-
-
-def _code_part(line):
-    """(balanced, code): the line without a trailing comment, and whether every
-    quote opened on it is closed on it. Like nginx's tokenizer, a quote or '#'
-    only opens a string/comment at the start of a token; backslashes escape."""
-    q, esc, word_start = None, False, True
-    for i, ch in enumerate(line):
-        if esc:
-            esc = False
-            word_start = False
-        elif ch == "\\":
-            esc = True
-        elif q:
-            if ch == q:
-                q = None
-        elif ch.isspace() or ch in ";{}":
-            word_start = True
-        elif word_start and ch in "\"'":
-            q = ch
-            word_start = False
-        elif word_start and ch == "#":
-            return True, line[:i]
-        else:
-            word_start = False
-    return q is None, line
-
-
-def _tokens(s):
-    """Whitespace tokens of a stripped line; directives are recognised only by
-    their first token, never by text appearing elsewhere on the line."""
-    return s.split()
-
-
-def _is_pers_fmt(t):
-    return len(t) >= 2 and t[0] == "log_format" and t[1].endswith("_persistent")
-
-
-def _is_base_fmt(t):
-    return len(t) >= 2 and t[0] == "log_format" and not t[1].endswith("_persistent")
-
-
-def _is_enhance_log(t):
-    return (len(t) >= 3 and t[0] == "access_log"
-            and t[1].startswith("/var/local/enhance/webserver_logs/"))
-
-
-def _enhance_log_uuid(s):
-    """UUID from an Enhance `access_log /var/local/enhance/webserver_logs/<uuid>.log fmt;` line."""
-    parts = s.split()
-    if len(parts) < 3:
+def _enhance_log_uuid(path):
+    """UUID from an Enhance access log path /var/local/enhance/webserver_logs/<uuid>.log."""
+    if not path.startswith(ENHANCE_LOG_DIR):
         return None
-    name = parts[1].rsplit("/", 1)[-1]
+    name = path[len(ENHANCE_LOG_DIR):]
     if not name.endswith(".log"):
         return None
     u = name[:-len(".log")]
     return u if _UUID_RE.fullmatch(u) else None
 
 
-def _strip_webspace_logs(text):
-    """Remove every access_log directive pointing below /var/www. Returns (text, removed)."""
-    removed = 0
+def _is_pers_log(d):
+    return d.name == "access_log" and bool(d.args) and d.args[0].startswith(f"{SITE_LOGS_DIR}/")
 
-    def repl(m):
-        nonlocal removed
-        if m.group(1) is not None:
-            return m.group(1)
-        removed += 1
-        return ""
-    return _WEBSPACE_LOG_RE.sub(repl, text), removed
+
+def _is_pers_fmt(d):
+    return d.name == "log_format" and bool(d.args) and d.args[0].endswith("_persistent")
+
+
+def _is_base_fmt(d):
+    return d.name == "log_format" and bool(d.args) and not d.args[0].endswith("_persistent")
+
+
+def _is_enhance_log(d):
+    return d.name == "access_log" and bool(d.args) and d.args[0].startswith(ENHANCE_LOG_DIR)
 
 
 NGINX_DROPIN  = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
@@ -293,6 +254,19 @@ def run(config, logger):
         logger.info("All configs up to date, no changes needed")
         _cleanup_backup(backup_dir, logger)
         _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
+        return
+
+    # nginx -t opens every log file as root: check the destinations first
+    try:
+        problems, errors = _nginxconf().webspace_log_check(str(NGINX_CONF))
+    except Exception as e:
+        problems, errors = [], [f"preflight failed: {e}"]
+    if problems or errors:
+        logger.error("nginx config not tested or reloaded, log destination check failed: "
+                     + "; ".join((problems + errors)[:5]))
+        if _restore_backup(backup_dir, logger):
+            logger.info("Configs restored from backup")
+        _cleanup_backup(backup_dir, logger)
         return
 
     ok, output = _test_nginx()
@@ -964,16 +938,20 @@ def _persistent_log_format(fmt_name, ip_var, conn_ip_on):
 def apply_logging_features(config, logger):
     """
     Add or remove persistent access logging and real IP detection across all
-    non-default vhost confs. The persistent log format is always stripped and
-    re-added during any rebuild to prevent duplicates.
+    non-default vhost confs.
 
-    Persistent logging is only added to a vhost when everything it needs is
-    there (the Enhance access_log with a valid webspace UUID, a base log_format
-    and a ready log directory); otherwise any persistent lines are removed, so a
-    vhost never keeps an orphaned format or a log without a format. Any
-    access_log below /var/www is always removed. A file is only rewritten when
-    its content actually changes.
+    Vhosts are read with the nginx tokenizer (modules/nginxconf). A file nginx
+    would not accept, or one where a log_format or a relevant access_log is not
+    alone on its own line, is left byte-for-byte unchanged. Any access_log below
+    /var/www is always removed. Persistent logging is only added when the vhost
+    has the Enhance access_log with a valid webspace UUID, a base log_format with
+    a plain name and a ready log directory; otherwise persistent lines are
+    removed, so a vhost never keeps an orphaned format or a log without a format.
+    The persistent format goes directly after the base log_format, and one
+    persistent access_log after each Enhance access_log of the webspace. A file is
+    only rewritten when its content changes.
     """
+    nc          = _nginxconf()
     general     = config.get("general", {})
     features    = config.get("nginx", {}).get("features", {})
     pers_on     = general.get("persistent_logging", False)
@@ -994,48 +972,62 @@ def apply_logging_features(config, logger):
             logger.error(f"Failed to read {filename}: {e}")
             continue
 
-        # quoted strings spanning lines cannot be handled by this line-based
-        # editor: leave such a file exactly as it is (the deploy checks look for
-        # webspace log paths in every nginx file independently)
-        if not all(_code_part(l)[0] for l in original.splitlines()):
-            logger.warning(f"logging_features: {filename} has a quoted string spanning lines, "
-                           "not changing it")
+        try:
+            legacy = [d for d in nc.parse(original) if d.name == "access_log" and nc.is_webspace_log(d)]
+            text   = nc.remove_directives(original, legacy)
+            ds     = nc.parse(text)
+        except nc.ConfError as e:
+            logger.warning(f"logging_features: {filename} cannot be parsed ({e}), not changing it")
+            continue
+        has_legacy_log = bool(legacy)
+
+        sole = nc.sole_on_line(text, ds)
+        relevant = [d for d in ds if d.name == "log_format"
+                    or _is_pers_log(d) or _is_enhance_log(d)]
+        if any(sole.get(d.line_start) is not d for d in relevant):
+            # not editable line by line; still never keep a log inside a webspace
+            if has_legacy_log and _write_checked(cf, text, logger):
+                logger.warning(f"logging_features: access_log below /var/www removed — {filename} "
+                               "(otherwise left unchanged: a log_format or access_log is not alone "
+                               "on its line)")
+                any_changed = True
+            else:
+                logger.warning(f"logging_features: a log_format or access_log in {filename} is not "
+                               "alone on its line, not changing it")
             continue
 
-        text, n_legacy = _strip_webspace_logs(original)
-        has_legacy_log = n_legacy > 0
-        lines          = text.splitlines(keepends=True)
+        lines = text.splitlines(keepends=True)
 
-        pers_logs       = []      # current persistent access_log lines (stripped)
+        pers_logs       = []      # args of current persistent access_logs
         n_pers_fmt      = 0
+        pers_fmt_line   = None
         has_realip_map  = False
         has_realip_fmt  = False
         uuid            = None
-        enh_logs        = 0       # Enhance access_log lines for that uuid
+        enh_logs        = 0       # Enhance access_logs of that uuid
         base_fmt        = None
         base_fmt_idx    = None    # line the persistent format is inserted after
-        fmts_single     = True    # every log_format is one complete line
 
         for i, line in enumerate(lines):
             s = line.strip()
-            if s.startswith("#"):
-                continue
-            t = _tokens(s)
-            if t[:1] == ["log_format"] and not _code_part(s)[1].rstrip().endswith(";"):
-                fmts_single = False
-            if _is_current_pers_log_line(s):
-                pers_logs.append(s)
-            elif _is_pers_fmt(t):
-                n_pers_fmt += 1
-            elif s.startswith("map $http_cf_connecting_ip $actual_addr"):
+            d = sole.get(i)
+            if s.startswith("map $http_cf_connecting_ip $actual_addr"):
                 has_realip_map = True
-            elif _is_base_fmt(t):
+            if d is None:
+                continue
+            if _is_pers_log(d):
+                pers_logs.append(d.args)
+            elif _is_pers_fmt(d):
+                n_pers_fmt += 1
+                if pers_fmt_line is None:
+                    pers_fmt_line = s
+            elif _is_base_fmt(d):
                 if "$actual_addr" in s:
                     has_realip_fmt = True
                 if base_fmt is None:
-                    base_fmt, base_fmt_idx = t[1], i
-            elif _is_enhance_log(t):
-                u = _enhance_log_uuid(s)
+                    base_fmt, base_fmt_idx = d.args[0], i
+            elif _is_enhance_log(d):
+                u = _enhance_log_uuid(d.args[0])
                 if uuid is None:
                     uuid = u
                 if u is not None and u == uuid:
@@ -1043,44 +1035,27 @@ def apply_logging_features(config, logger):
 
         cur_realip   = has_realip_map and has_realip_fmt
         has_pers_fmt = n_pers_fmt > 0
+        has_pers_log = bool(pers_logs)
 
         want = False
         if pers_on:
-            if not (uuid and _UUID_RE.fullmatch(uuid)):
+            if not uuid:
                 logger.debug(f"logging_features: no webspace UUID in {filename}, no persistent log")
-            elif not (base_fmt and fmts_single and re.fullmatch(r"[A-Za-z0-9_.-]+", base_fmt)):
-                logger.debug(f"logging_features: no usable single-line log_format in {filename}, "
-                             "no persistent log")
+            elif not (base_fmt and _FMT_NAME_RE.fullmatch(base_fmt)):
+                logger.debug(f"logging_features: no usable log_format in {filename}, no persistent log")
             else:
                 want = _ensure_site_log_dir(uuid, logger)
 
-        # check if the persistent format matches the current settings exactly
-        # (a substring check on ip_var is not enough: "$remote_addr" is also
-        # contained in "$realip_remote_addr")
-        pers_fmt_correct = True
-        if want and has_pers_fmt:
-            expected = _persistent_log_format(base_fmt, ip_var, conn_ip_on).strip()
-            for line in lines:
-                s = line.strip()
-                if not s.startswith("#") and _is_pers_fmt(_tokens(s)):
-                    if s != expected:
-                        pers_fmt_correct = False
-                    break
-
-        # exactly one persistent line, with the exact path and format, per Enhance
-        # access_log of this webspace -- or none at all
         if want:
-            expected_log = (f"access_log {_site_log_path(uuid, 'webserver.log')} "
-                            f"{base_fmt}_persistent;")
-            pers_logs_correct = pers_logs == [expected_log] * enh_logs
+            expected_fmt  = _persistent_log_format(base_fmt, ip_var, conn_ip_on).strip()
+            expected_path = str(_site_log_path(uuid, "webserver.log"))
+            expected_log  = f"access_log {expected_path} {base_fmt}_persistent;"
+            ok_pers = (pers_logs == [[expected_path, f"{base_fmt}_persistent"]] * enh_logs
+                       and n_pers_fmt == 1 and pers_fmt_line == expected_fmt)
         else:
-            pers_logs_correct = not pers_logs
-        has_pers_log = bool(pers_logs)
+            ok_pers = not pers_logs and n_pers_fmt == 0
 
-        if (pers_logs_correct and n_pers_fmt == (1 if want else 0) and
-                cur_realip == realip_on and
-                pers_fmt_correct and
-                not has_legacy_log):
+        if ok_pers and cur_realip == realip_on and not has_legacy_log:
             continue
 
         # rebuild config
@@ -1091,38 +1066,31 @@ def apply_logging_features(config, logger):
 
         for i, line in enumerate(lines):
             s    = line.strip()
-            t    = _tokens(s)
+            d    = sole.get(i)
             base = _indent(lines, i)
 
-            if s.startswith("#"):
-                new_lines.append(line)      # comments are never interpreted or changed
+            if not realip_on and s.startswith("map $http_cf_connecting_ip $actual_addr"):
                 continue
 
-            elif not realip_on and s.startswith("map $http_cf_connecting_ip $actual_addr"):
+            if d is None:
+                new_lines.append(line)
+
+            # always strip persistent lines -- re-added below to prevent duplicates
+            elif _is_pers_log(d) or _is_pers_fmt(d):
                 continue
 
-            # always strip the persistent log line — re-added below to prevent duplicates
-            elif _is_current_pers_log_line(s):
-                continue
-
-            # always strip the persistent format — re-added below with correct ip_var
-            elif _is_pers_fmt(t):
-                continue
-
-            elif _is_base_fmt(t):
+            elif _is_base_fmt(d):
                 if realip_on and "$remote_addr" in s:
                     new_lines.append(line.replace("$remote_addr", "$actual_addr"))
                 elif not realip_on and "$actual_addr" in s:
                     new_lines.append(line.replace("$actual_addr", "$remote_addr"))
                 else:
                     new_lines.append(line)
-
                 if want and i == base_fmt_idx:
                     new_lines.append(_persistent_log_format(base_fmt, ip_var, conn_ip_on))
                     pers_fmt_added = True
-                continue
 
-            elif (s.startswith("fastcgi_cache_path") and realip_on
+            elif (d.name == "fastcgi_cache_path" and realip_on
                   and not realip_added and not has_realip_map):
                 new_lines.append(
                     "map $http_cf_connecting_ip $actual_addr "
@@ -1130,13 +1098,11 @@ def apply_logging_features(config, logger):
                 )
                 new_lines.append(line)
                 realip_added = True
-                continue
 
-            elif _is_enhance_log(t) and want and _enhance_log_uuid(s) == uuid:
+            elif _is_enhance_log(d) and want and _enhance_log_uuid(d.args[0]) == uuid:
                 new_lines.append(line)
                 new_lines.append(f"{base}{expected_log}\n")
                 pers_added += 1
-                continue
 
             else:
                 new_lines.append(line)
@@ -1148,6 +1114,12 @@ def apply_logging_features(config, logger):
                          "leaving it unchanged")
             continue
         if new_text == original:
+            continue
+        try:
+            nc.parse(new_text)
+        except nc.ConfError as e:
+            logger.error(f"logging_features: rebuilt {filename} would not parse ({e}), "
+                         "leaving it unchanged")
             continue
 
         try:
@@ -1170,6 +1142,18 @@ def apply_logging_features(config, logger):
             logger.error(f"Failed to write {filename}: {e}")
 
     return any_changed
+
+
+def _write_checked(cf, text, logger):
+    """Write text to cf only if it parses. Returns True on success."""
+    nc = _nginxconf()
+    try:
+        nc.parse(text)
+        cf.write_text(text)
+        return True
+    except (nc.ConfError, OSError) as e:
+        logger.error(f"Failed to write {cf.name}: {e}")
+        return False
 
 
 def _nginx_worker_user():
@@ -1481,12 +1465,12 @@ def _site_confs():
 
 
 def _extract_uuid_from_conf(cf):
-    """Extract site UUID from the Enhance-generated access_log line in a vhost conf."""
+    """Extract site UUID from the Enhance-generated access_log directive in a vhost conf."""
+    nc = _nginxconf()
     try:
-        for line in cf.read_text().splitlines():
-            s = line.strip()
-            if not s.startswith("#") and _is_enhance_log(_tokens(s)):
-                return _enhance_log_uuid(s)
+        for d in nc.parse(cf.read_text()):
+            if _is_enhance_log(d):
+                return _enhance_log_uuid(d.args[0])
     except Exception:
         pass
     return None

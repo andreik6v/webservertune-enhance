@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""
+nginxconf
+Minimal nginx configuration reader shared by nginxtune and fastcgiclear.
+
+It tokenizes like nginx's ngx_conf_read_token: whitespace separates tokens,
+quotes and '#' only start a string or comment at the start of a token,
+backslash escapes the next character, ';' ends a directive, '{' opens a
+block and '}' closes one, and "${" inside a token is a variable, not a block.
+Nothing here runs nginx: `nginx -t` already opens every log file as root,
+so checks on log destinations must happen before it.
+"""
+
+import glob
+import os
+from collections import namedtuple
+
+NGINX_PREFIX = "/etc/nginx"      # nginx -V --prefix on Enhance servers
+WWW_DIR      = "/var/www"
+
+# name: directive name; args: decoded arguments; start/end: character offsets
+# of the whole directive including its terminator; line_start/line_end:
+# 0-based line numbers; term: ";" or "{"; depth: block nesting level
+Directive = namedtuple("Directive", "name args start end line_start line_end term depth")
+
+
+class ConfError(Exception):
+    """The text is not something nginx would accept (or not something we parse)."""
+
+
+_ESCAPES = {'"': '"', "'": "'", "\\": "\\", "t": "\t", "r": "\r", "n": "\n"}
+
+
+def _unescape(raw):
+    out, i = [], 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw) and raw[i + 1] in _ESCAPES:
+            out.append(_ESCAPES[raw[i + 1]])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def parse(text):
+    """Return every directive in text, in order. Raises ConfError on input nginx
+    would reject: unbalanced quotes or braces, ';' or '{' without a name, or a
+    directive left open at the end."""
+    directives = []
+    args, d_start, d_line = [], None, 0
+    depth, line, i, n = 0, 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if ch in " \t\r":
+            i += 1
+            continue
+        if ch == "#":                              # comment at token start
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if ch in ";{":
+            if not args:
+                raise ConfError(f"line {line + 1}: unexpected '{ch}'")
+            directives.append(Directive(args[0], args[1:], d_start, i + 1, d_line, line, ch, depth))
+            if ch == "{":
+                depth += 1
+            args, d_start = [], None
+            i += 1
+            continue
+        if ch == "}":
+            if args:
+                raise ConfError(f"line {line + 1}: unexpected '}}'")
+            if depth == 0:
+                raise ConfError(f"line {line + 1}: unexpected '}}'")
+            depth -= 1
+            i += 1
+            continue
+        # a token starts here
+        if d_start is None:
+            d_start, d_line = i, line
+        if ch in "\"'":
+            q, j, raw = ch, i + 1, []
+            while True:
+                if j >= n:
+                    raise ConfError(f"line {line + 1}: unterminated quoted string")
+                c = text[j]
+                if c == "\\" and j + 1 < n:
+                    raw.append(text[j:j + 2])
+                    if text[j + 1] == "\n":
+                        line += 1
+                    j += 2
+                    continue
+                if c == q:
+                    break
+                if c == "\n":
+                    line += 1
+                raw.append(c)
+                j += 1
+            args.append(_unescape("".join(raw)))
+            i = j + 1
+            # like nginx: after a quoted string only whitespace, ';', '{' or ')'
+            # (as in `if ($a = "x")`) may follow
+            if i < n and text[i] not in " \t\r\n;{)":
+                raise ConfError(f"line {line + 1}: unexpected character after quoted string")
+            continue
+        j, raw, var = i, [], False
+        while j < n:
+            c = text[j]
+            if c == "\\" and j + 1 < n:
+                raw.append(text[j:j + 2])
+                j += 2
+                continue
+            if var:
+                raw.append(c)
+                if c == "}":
+                    var = False
+                j += 1
+                continue
+            if c == "{" and raw and raw[-1] == "$":
+                var = True
+                raw.append(c)
+                j += 1
+                continue
+            if c in " \t\r\n;{}":
+                break
+            raw.append(c)
+            j += 1
+        args.append(_unescape("".join(raw)))
+        i = j
+    if args or depth:
+        raise ConfError("unexpected end of file")
+    return directives
+
+
+def _resolve(path, base):
+    return os.path.normpath(path if path.startswith("/") else os.path.join(base, path))
+
+
+def _below_www(path):
+    real_www = os.path.realpath(WWW_DIR)
+    for p in {os.path.normpath(path), os.path.realpath(path)}:
+        for w in {WWW_DIR, real_www}:
+            if p == w or p.startswith(w + "/"):
+                return True
+    return False
+
+
+def include_graph(root, prefix=NGINX_PREFIX):
+    """Yield (file, text, directives) for root and every file it includes,
+    recursively. Literal includes that do not exist and unreadable or unparseable
+    files are reported in the returned error list."""
+    seen, out, errors = set(), [], []
+    stack = [root]
+    while stack:
+        f = stack.pop()
+        real = os.path.realpath(f)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            with open(f, encoding="utf-8", errors="surrogateescape") as fh:
+                text = fh.read()
+            ds = parse(text)
+        except (OSError, ConfError) as e:
+            errors.append(f"{f}: {e}")
+            continue
+        out.append((f, text, ds))
+        for d in ds:
+            if d.name != "include" or not d.args:
+                continue
+            pat = _resolve(d.args[0], prefix)
+            if glob.has_magic(pat):
+                stack.extend(sorted(glob.glob(pat), reverse=True))
+            elif os.path.exists(pat):
+                stack.append(pat)
+            else:
+                errors.append(f"{f}: include {d.args[0]} does not exist")
+    return out, errors
+
+
+def is_webspace_log(d, prefix=NGINX_PREFIX):
+    """True if d is an access_log/error_log whose destination is /var/www or
+    below, or cannot be judged because it starts with a variable."""
+    if d.name not in ("access_log", "error_log") or not d.args:
+        return False
+    dest = d.args[0]
+    if dest == "off" or dest == "stderr" or dest.startswith(("syslog:", "memory:")):
+        return False
+    if dest.startswith("$"):
+        return True
+    path = _resolve(dest.split("$", 1)[0], prefix)
+    if "$" in dest:
+        path = os.path.dirname(path) or "/"
+    return _below_www(path)
+
+
+def sole_on_line(text, directives):
+    """{line number: directive} for every directive that is complete on one line
+    and alone on it (only whitespace before it, only whitespace or a comment
+    after it). Lines holding several directives, a brace or part of a multi-line
+    directive are absent."""
+    starts = {}
+    for d in directives:
+        for ln in range(d.line_start, d.line_end + 1):
+            starts.setdefault(ln, []).append(d)
+    out = {}
+    for ln, ds in starts.items():
+        if len(ds) != 1:
+            continue
+        d = ds[0]
+        if d.line_start != d.line_end or d.term != ";":
+            continue
+        b = text.rfind("\n", 0, d.start) + 1
+        e = text.find("\n", d.end)
+        e = len(text) if e < 0 else e
+        after = text[d.end:e].strip()
+        if text[b:d.start].strip() == "" and (after == "" or after.startswith("#")):
+            out[ln] = d
+    return out
+
+
+def remove_directives(text, directives):
+    """Remove the given directives from text. A line left empty (or holding only
+    the removed directive) disappears entirely; anything else on the line stays."""
+    for d in sorted(directives, key=lambda d: d.start, reverse=True):
+        b = text.rfind("\n", 0, d.start) + 1
+        e = text.find("\n", d.end)
+        e = len(text) if e < 0 else e
+        if (text[b:d.start] + text[d.end:e]).strip() == "":
+            text = text[:b] + text[e + 1:]
+        else:
+            text = text[:d.start] + text[d.end:]
+    return text
+
+
+def log_destination_problems(directives, prefix=NGINX_PREFIX, where=""):
+    """access_log/error_log destinations that resolve to /var/www or below, or
+    that cannot be judged (a path starting with a variable)."""
+    bad = []
+    for d in directives:
+        if is_webspace_log(d, prefix):
+            bad.append(f"{where}line {d.line_start + 1}: {d.name} {d.args[0]}")
+    return bad
+
+
+def webspace_log_check(root, prefix=NGINX_PREFIX):
+    """(problems, errors) over the whole include graph of root. Both empty means
+    no access_log/error_log anywhere points into a webspace."""
+    files, errors = include_graph(root, prefix)
+    problems = []
+    for f, _text, ds in files:
+        problems += log_destination_problems(ds, prefix, where=f"{f}: ")
+    return problems, errors
+
+
+if __name__ == "__main__":
+    import sys
+    root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(NGINX_PREFIX, "nginx.conf")
+    files, errors = include_graph(root)
+    problems = []
+    for f, _t, ds in files:
+        problems += log_destination_problems(ds, where=f"{f}: ")
+    print(f"files={len(files)} webspace_logs={len(problems)} errors={len(errors)}")
+    for p in problems:
+        print("  BAD", p)
+    for e in errors:
+        print("  ERROR", e)
+    sys.exit(1 if problems or errors else 0)
