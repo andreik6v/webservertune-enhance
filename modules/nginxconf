@@ -182,9 +182,11 @@ def _reaches_www(path):
             return True
         try:
             st = os.lstat(nxt)
-        except OSError:
+        except FileNotFoundError:
             cur = nxt                      # does not exist (yet): the rest is literal
             continue
+        except OSError:
+            return True                    # cannot inspect: refuse
         if stat.S_ISLNK(st.st_mode):
             hops += 1
             if hops > MAX_SYMLINK_HOPS:
@@ -203,41 +205,58 @@ def _reaches_www(path):
     return _in_www(cur)
 
 
+def read_config_file(path):
+    """Text of a config file. Opened without blocking and must be a regular file,
+    so a FIFO or device at an include path cannot stall or feed the reader."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ConfError("not a regular file")
+        with os.fdopen(fd, encoding="utf-8", errors="surrogateescape") as fh:
+            fd = None
+            return fh.read()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def include_graph(root, prefix=NGINX_PREFIX, conf_base=None):
     """Return ([(file, text, directives)], errors) for root and every file it
-    includes, recursively. Relative includes resolve against conf_base, which
-    defaults to the directory of root (nginx's conf prefix when root is the main
-    config; pass it explicitly when root is a file nginx.conf includes).
-    Literal includes that do not exist and unreadable or unparseable files are
-    reported as errors."""
+    includes, recursively, in nginx's load order. Each directive's ctx is its
+    effective context: the blocks around the include that pulled its file in,
+    followed by the blocks inside the file. Relative includes resolve against
+    conf_base, by default the directory of root (nginx's conf prefix when root
+    is the main config). Missing literal includes and unreadable, non-regular
+    or unparseable files are errors."""
     if conf_base is None:
         conf_base = os.path.dirname(os.path.abspath(root))
     seen, out, errors = set(), [], []
-    stack = [root]
+    stack = [(root, ())]
     while stack:
-        f = stack.pop()
+        f, base_ctx = stack.pop()
         real = os.path.realpath(f)
         if real in seen:
             continue
         seen.add(real)
         try:
-            with open(f, encoding="utf-8", errors="surrogateescape") as fh:
-                text = fh.read()
-            ds = parse(text)
+            text = read_config_file(f)
+            ds = [d._replace(ctx=base_ctx + d.ctx, depth=len(base_ctx) + d.depth) for d in parse(text)]
         except (OSError, ConfError) as e:
             errors.append(f"{f}: {e}")
             continue
         out.append((f, text, ds))
+        children = []
         for d in ds:
             if d.name != "include" or not d.args or set(d.ctx) & DATA_BLOCKS:
                 continue
             pat = _resolve(d.args[0], conf_base)
             if glob.has_magic(pat):
-                stack.extend(sorted(glob.glob(pat), reverse=True))
-            elif os.path.exists(pat):
-                stack.append(pat)
+                children.extend((g, d.ctx) for g in sorted(glob.glob(pat)))
+            elif os.path.lexists(pat):
+                children.append((pat, d.ctx))
             else:
                 errors.append(f"{f}: include {d.args[0]} does not exist")
+        stack.extend(reversed(children))
     return out, errors
 
 

@@ -90,6 +90,10 @@ class FastcgiclearTests(unittest.TestCase):
         self.ws.mkdir()
         give_to_tenant(self.ws)
         self.v = Victims(self.tmp)
+        # nginx.conf loading the vhosts the way Enhance's does
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        fcc.NGINX_CONF = self.tmp / "nginx.conf"
+        fcc.NGINX_CONF_DIR = self.tmp
 
     def wp(self, *sub):
         root = self.ws.joinpath(*sub)
@@ -475,6 +479,47 @@ class FastcgiclearTests(unittest.TestCase):
             f"server {{ include {inc}; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
+        os.unlink(sites / "alias.conf")
+        # an include that disappears (or is not a regular file) makes the whole
+        # answer unreliable, even for a vhost that does not name the webspace
+        (sites / "alias.conf").write_text(
+            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            f"server {{ include {self.tmp}/gone.conf; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        fifo = self.tmp / "fifo.conf"
+        os.mkfifo(fifo)
+        (sites / "alias.conf").write_text(f"server {{ include {fifo}; }}\n")
+        done = {}
+
+        def scan():
+            try:
+                fcc.find_cache_paths(UUID)
+            except fcc.UnsafePath:
+                done["refused"] = True
+        t = threading.Thread(target=scan, daemon=True)
+        t.start()
+        t.join(3)
+        self.assertFalse(t.is_alive(), "include of a FIFO blocked the scan")
+        self.assertTrue(done.get("refused"))
+        os.unlink(sites / "alias.conf")
+        # the webspace log inherited from nginx.conf's http block, or set in a
+        # location, is not a vhost's own server-level log: refuse
+        (self.tmp / "nginx.conf").write_text(
+            f"http {{ access_log /var/local/enhance/webserver_logs/{UUID}.log m;\n"
+            f"include {self.tmp}/sites-enabled/*; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        (sites / "alias.conf").write_text(
+            f"server {{ location / {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }} }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        # a map row in an included file is data, not a log
+        inc = self.tmp / "maps.conf"
+        inc.write_text(f"map $a $b {{ access_log /var/local/enhance/webserver_logs/{UUID}.log; }}\n")
+        (sites / "alias.conf").write_text(f"include {inc};\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
         # a top-level include in a matched vhost could declare more zones
         zones = self.tmp / "zones.conf"
         zones.write_text("fastcgi_cache_path /c/zone levels=1:2;\n")
@@ -1143,6 +1188,18 @@ class NginxConfTests(unittest.TestCase):
         (root / "nginx.conf").write_text(f"access_log {root}/loop1/a.log;\n")
         problems, _ = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
         self.assertEqual(len(problems), 1)
+
+    def test_uninspectable_path_component_refused(self):
+        if AS_ROOT:
+            self.skipTest("root can inspect any directory")
+        root = self._tree()
+        locked = root / "locked"
+        (locked / "sub").mkdir(parents=True)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o700)
+        (root / "nginx.conf").write_text(f"access_log {locked}/sub/a.log;\n")
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(len(problems), 1, problems)
 
     def test_symlink_into_webspace_and_variables_detected(self):
         root = self._tree()

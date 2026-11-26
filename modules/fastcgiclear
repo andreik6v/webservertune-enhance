@@ -22,6 +22,8 @@ from pathlib import Path
 
 WWW_DIR        = Path("/var/www")
 SITES_DIR      = Path("/etc/nginx/sites-enabled")
+NGINX_CONF     = Path("/etc/nginx/nginx.conf")
+NGINX_CONF_DIR = Path("/etc/nginx")    # nginx's conf prefix: base of relative includes
 FLAG_FILE      = "clear.cache"
 MU_PLUGIN_NAME = "fastcgiclear.php"
 MU_PLUGIN_SRC  = Path("/opt/webservertune-enhance/assets") / MU_PLUGIN_NAME
@@ -414,66 +416,55 @@ def _nginxconf():
 
 
 def find_cache_paths(uuid):
-    """FastCGI cache directories of every vhost whose Enhance access_log belongs
-    to uuid. A webspace can have several domains and preview aliases, each with
-    at most one cache zone (none when caching is off for it).
+    """FastCGI cache directories of every vhost that serves the webspace.
 
-    Directives are read with the nginx tokenizer, so comments, argument text and
-    rows of data blocks such as map never count. Raises UnsafePath whenever the answer could be incomplete or
-    ambiguous: no vhost names the webspace, a vhost disappears during the scan,
-    a matching vhost cannot be parsed or has more than one cache zone.
+    nginx's effective configuration is read from nginx.conf through every
+    include (modules/nginxconf), so each directive has its real context. A vhost
+    belongs to the webspace when one of its server blocks, in a file directly in
+    sites-enabled, has the Enhance access_log of the webspace; its cache zone is
+    the vhost file's own http-level fastcgi_cache_path (at most one, none when
+    caching is off for it). A webspace can have several such vhosts (domains,
+    preview aliases).
+
+    Raises UnsafePath whenever the answer could be incomplete or ambiguous: any
+    file of the configuration cannot be read or parsed, no vhost names the
+    webspace, the webspace's log appears anywhere else (another context, an
+    included file), or a matched vhost has more than one zone or includes other
+    files at http level.
     """
     nc       = _nginxconf()
     want_log = f"/var/local/enhance/webserver_logs/{uuid}.log"
     if not SITES_DIR.is_dir():
         raise UnsafePath(f"{SITES_DIR} is not a directory")
-
-    def names_log(d):
-        return d.name == "access_log" and d.args[:1] == [want_log]
-
-    paths, matched = [], 0
-    for cf in sorted(SITES_DIR.glob("*.conf")):
-        if cf.name.startswith("000-"):
-            continue
-        try:
-            # read-only: undecodable bytes in an unrelated vhost must not block clears
-            content = cf.read_text(encoding="utf-8", errors="surrogateescape")
-        except FileNotFoundError:
-            # removed or being regenerated: nginx may still serve it
-            raise UnsafePath(f"{cf.name} disappeared while scanning")
-        try:
-            ds = nc.parse(content)
-        except nc.ConfError as e:
-            if want_log in content:
-                raise UnsafePath(f"{cf.name} cannot be parsed: {e}")
-            continue
-        # the webspace's log anywhere but directly in a server block (another
-        # context, or a file this vhost includes) would hide a vhost and its
-        # cache zone: refuse rather than clear only part of the site
+    files, errors = nc.include_graph(str(NGINX_CONF), conf_base=str(NGINX_CONF_DIR))
+    if errors:
+        raise UnsafePath(f"nginx configuration cannot be read completely: {errors[0]}")
+    vhost_dir = os.path.realpath(SITES_DIR)
+    by_file, matched = {}, {}
+    for f, _text, ds in files:
+        by_file[f] = ds
         for d in ds:
-            if names_log(d) and not ("server" in d.ctx and not set(d.ctx) & nc.DATA_BLOCKS):
-                raise UnsafePath(f"{cf.name} names the webspace log outside a server block")
-        included, errors = nc.include_graph(str(cf), conf_base=nc.NGINX_PREFIX)
-        if errors:
-            if want_log in content or any(want_log in e for e in errors):
-                raise UnsafePath(f"{cf.name}: {errors[0]}")
-        for f, _text, ids in included[1:]:
-            if any(names_log(d) for d in ids):
-                raise UnsafePath(f"{cf.name} gets the webspace log from {f}")
-        if not any(names_log(d) for d in ds):
-            continue
-        matched += 1
-        # the vhost file is included at http level: cache zones are its top-level
-        # fastcgi_cache_path directives; a top-level include could declare more
-        if any(d.name == "include" and d.ctx == () for d in ds):
-            raise UnsafePath(f"{cf.name} includes other files at http level")
-        found = [Path(d.args[0]) for d in ds
-                 if d.name == "fastcgi_cache_path" and d.args and d.ctx == ()]
-        if len(found) > 1:
-            raise UnsafePath(f"{cf.name} has {len(found)} fastcgi_cache_path directives")
-        paths.extend(found)
-    if matched == 0:
+            if not (d.name == "access_log" and d.args[:1] == [want_log]) or set(d.ctx) & nc.DATA_BLOCKS:
+                continue                # rows of map/geo/... blocks are data
+            in_vhost = (os.path.dirname(os.path.realpath(f)) == vhost_dir
+                        and not os.path.basename(f).startswith("000-"))
+            if not in_vhost or d.ctx != ("http", "server"):
+                raise UnsafePath(f"{f} names the webspace log outside a vhost's server block")
+            matched[f] = d.ctx[:-1]
+    if not matched:
         raise UnsafePath("no vhost names this webspace")
+    paths = []
+    for f, base in matched.items():
+        ds = by_file[f]
+        # the vhost file sits at http level: cache zones are its http-level
+        # fastcgi_cache_path directives; an http-level include could declare more
+        if any(d.name == "include" and d.ctx == base for d in ds):
+            raise UnsafePath(f"{os.path.basename(f)} includes other files at http level")
+        found = [Path(d.args[0]) for d in ds
+                 if d.name == "fastcgi_cache_path" and d.args and d.ctx == base]
+        if len(found) > 1:
+            raise UnsafePath(f"{os.path.basename(f)} has {len(found)} fastcgi_cache_path directives")
+        paths.extend(found)
     return paths
 
 
