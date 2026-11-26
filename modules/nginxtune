@@ -6,10 +6,12 @@ Manages HTTP/3, security includes, logging, FastCGI cache and body size settings
 Called by webservertune-enhance main program.
 """
 
+import grp
 import importlib.util
 import logging
 import os
 import re
+import stat
 import shutil
 import subprocess
 import threading
@@ -24,6 +26,27 @@ BACKUP_BASE   = Path("/opt/webservertune-enhance/backups/nginx")
 OVERRIDES     = Path("/opt/webservertune-enhance/overrides")
 REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
 CACHE_EXCLUDES_DIR = Path("/opt/webservertune-enhance/cache-excludes")
+
+# Persistent per-site logs live in a root-owned tree outside the webspaces.
+# They used to be written to /var/www/<uuid>/logs/, which the site user can
+# write: the nginx master opens access_log files as root and follows symlinks,
+# and this service chowned/chmodded entries there, so a tenant could redirect
+# either to a host file. Lines pointing at the legacy location are migrated.
+SITE_LOGS_DIR   = Path("/var/log/webservertune-enhance/sites")
+SITE_LOGS_GROUP = "adm"   # readable by log shippers in the adm group (e.g. Vector)
+_UUID_RE        = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+
+def _site_log_path(uuid, name):
+    return SITE_LOGS_DIR / uuid / name
+
+
+def _is_current_pers_log_line(s):
+    return s.startswith(f"access_log {SITE_LOGS_DIR}/") and "/webserver.log " in s
+
+
+def _is_legacy_pers_log_line(s):
+    return "access_log /var/www/" in s and "/logs/webserver.log" in s
 NGINX_DROPIN  = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
 ALT_SVC       = 'h3=":443"; ma=86400'
 
@@ -886,6 +909,7 @@ def apply_logging_features(config, logger):
             continue
 
         has_pers_log    = False
+        has_legacy_log  = False
         has_pers_fmt    = False
         has_realip_map  = False
         has_realip_fmt  = False
@@ -893,8 +917,10 @@ def apply_logging_features(config, logger):
 
         for line in lines:
             s = line.strip()
-            if "access_log /var/www/" in s and "/logs/webserver.log" in s:
+            if _is_current_pers_log_line(s):
                 has_pers_log = True
+            elif _is_legacy_pers_log_line(s):
+                has_legacy_log = True
             elif "log_format" in s and "_persistent" in s:
                 has_pers_fmt = True
             elif "map $http_cf_connecting_ip $actual_addr" in s:
@@ -927,13 +953,16 @@ def apply_logging_features(config, logger):
                         pers_fmt_correct = False
                     break
 
+        # a legacy log line inside the webspace is always removed, even with the
+        # feature disabled
         if (cur_pers == pers_on and
                 cur_realip == realip_on and
-                pers_fmt_correct):
+                pers_fmt_correct and
+                not has_legacy_log):
             continue
 
         if uuid and pers_on:
-            _ensure_log_dir(uuid, logger)
+            _ensure_site_log_dir(uuid, logger)
 
         # rebuild config
         new_lines       = []
@@ -948,8 +977,9 @@ def apply_logging_features(config, logger):
             if not realip_on and "map $http_cf_connecting_ip $actual_addr" in s:
                 continue
 
-            # always strip the persistent log line — re-added below to prevent duplicates
-            elif "access_log /var/www/" in s and "/logs/webserver.log" in s:
+            # always strip the persistent log line (current or legacy location) —
+            # re-added below to prevent duplicates
+            elif _is_current_pers_log_line(s) or _is_legacy_pers_log_line(s):
                 continue
 
             # always strip the persistent format — re-added below with correct ip_var
@@ -994,12 +1024,15 @@ def apply_logging_features(config, logger):
                         log_path   = parts[1]
                         log_fmt    = parts[2].rstrip(";")
                         file_uuid  = log_path.split("/")[-1].replace(".log", "")
-                        _ensure_log_dir(file_uuid, logger)
-                        new_lines.append(
-                            f"{base}access_log /var/www/{file_uuid}/logs/webserver.log "
-                            f"{log_fmt}_persistent;\n"
-                        )
-                        pers_added = True
+                        if not _UUID_RE.match(file_uuid):
+                            logger.error(f"logging_features: unexpected log name {file_uuid!r} in {filename}, "
+                                         "not adding persistent log")
+                        elif _ensure_site_log_dir(file_uuid, logger):
+                            new_lines.append(
+                                f"{base}access_log {_site_log_path(file_uuid, 'webserver.log')} "
+                                f"{log_fmt}_persistent;\n"
+                            )
+                            pers_added = True
                 except Exception:
                     pass
                 continue
@@ -1014,6 +1047,9 @@ def apply_logging_features(config, logger):
                 parts.append(f"persistent logging {'enabled' if pers_on else 'disabled'}")
             if cur_realip != realip_on:
                 parts.append(f"real IP logging {'enabled' if realip_on else 'disabled'}")
+            if has_legacy_log:
+                parts.append(f"persistent log moved out of /var/www to {SITE_LOGS_DIR}"
+                             if pers_on else "legacy persistent log line removed")
             if not parts and not pers_fmt_correct:
                 parts.append("persistent log format updated")
             logger.warning(f"logging_features: {'; '.join(parts)} — {filename}")
@@ -1024,31 +1060,41 @@ def apply_logging_features(config, logger):
     return any_changed
 
 
-def _ensure_log_dir(uuid, logger):
-    """Create /var/www/{uuid}/logs/ if absent and correct ownership and permissions on log files."""
-    site_dir = Path(f"/var/www/{uuid}")
-    if not site_dir.exists():
-        return
-    logs_dir = site_dir / "logs"
-    try:
-        if not logs_dir.exists():
-            logs_dir.mkdir(parents=True, mode=0o755)
-            parent_stat = os.stat(site_dir)
-            os.chown(logs_dir, parent_stat.st_uid, parent_stat.st_gid)
+def _ensure_site_log_dir(uuid, logger):
+    """
+    Create SITE_LOGS_DIR/<uuid>/ as a root-owned directory (root:adm, 0750).
 
-        parent_stat = os.stat(site_dir)
-        for lf in logs_dir.iterdir():
-            if lf.is_file():
-                fs          = os.stat(lf)
-                wrong_owner = fs.st_uid != parent_stat.st_uid or fs.st_gid != parent_stat.st_gid
-                wrong_perms = (fs.st_mode & 0o777) != 0o644
-                if wrong_owner or wrong_perms:
-                    if wrong_owner:
-                        os.chown(lf, parent_stat.st_uid, parent_stat.st_gid)
-                    if wrong_perms:
-                        os.chmod(lf, 0o644)
+    Never touches /var/www. Every component is checked with lstat, so a
+    symlinked directory is refused rather than followed. Returns True when the
+    directory is ready for nginx to write into.
+    """
+    if not _UUID_RE.match(uuid or ""):
+        logger.error(f"Refusing to create log dir for unexpected name {uuid!r}")
+        return False
+    try:
+        gid = grp.getgrnam(SITE_LOGS_GROUP).gr_gid
+    except KeyError:
+        gid = 0
+    is_root = os.geteuid() == 0
+    try:
+        for d in (SITE_LOGS_DIR, SITE_LOGS_DIR / uuid):
+            try:
+                os.mkdir(d, 0o750)
+            except FileExistsError:
+                pass
+            st = os.lstat(d)
+            if not stat.S_ISDIR(st.st_mode):
+                logger.error(f"{d} is not a directory (symlink?), refusing to use it")
+                return False
+            if is_root:
+                if st.st_uid != 0 or st.st_gid != gid:
+                    os.chown(d, 0, gid, follow_symlinks=False)
+                if (st.st_mode & 0o7777) != 0o750:
+                    os.chmod(d, 0o750)
+        return True
     except Exception as e:
         logger.error(f"Failed to set up log directory for {uuid}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1281,10 +1327,23 @@ class FileWatcher:
         self._open()
 
     def _open(self):
-        """Open the file and record its inode. Seeks to end if seek_to_end_on_open is set."""
+        """Open the file and record its inode. Seeks to end if seek_to_end_on_open is set.
+
+        The path may be inside a tenant webspace, so it is opened with O_NOFOLLOW
+        (and O_NONBLOCK, so a FIFO cannot block the thread) and must be a regular file.
+        """
         try:
-            self.fh = open(self.path, "r", errors="replace")
-            self.inode = os.fstat(self.fh.fileno()).st_ino
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                         | getattr(os, "O_CLOEXEC", 0))
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError(f"{self.path} is not a regular file")
+            except Exception:
+                os.close(fd)
+                raise
+            self.fh = os.fdopen(fd, "r", errors="replace")
+            self.inode = st.st_ino
             if self.seek_to_end_on_open:
                 self.fh.seek(0, 2)
             self.position = self.fh.tell()
@@ -1296,7 +1355,9 @@ class FileWatcher:
     def _reopen_if_needed(self):
         """Reopen the file if it has been rotated (inode changed) or truncated."""
         try:
-            stat = os.stat(self.path)
+            st = os.lstat(self.path)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(f"{self.path} is not a regular file")
         except OSError:
             if self.fh:
                 self.fh.close()
@@ -1308,13 +1369,13 @@ class FileWatcher:
             self._open()
             return
 
-        if stat.st_ino != self.inode:
+        if st.st_ino != self.inode:
             self.logger.debug(f"Recreated: {self.path}")
             self.fh.close()
             self._open()
             return
 
-        if stat.st_size < self.position:
+        if st.st_size < self.position:
             self.logger.debug(f"Truncated: {self.path}")
             self.fh.seek(0)
             self.position = 0
@@ -1393,7 +1454,8 @@ def _start_php_log_thread(config, logger):
 
 def _php_log_watcher(config, logger):
     """
-    Tail per-site php-error.log and php-fpm.log into /var/www/{uuid}/logs/php.log.
+    Tail per-site php-error.log and php-fpm.log into SITE_LOGS_DIR/{uuid}/php.log.
+    The sources are inside the webspace and are opened without following symlinks.
     Site discovery via inotify on sites-enabled plus full scan at startup.
     """
     registry      = {}  # uuid -> {"error": FileWatcher, "fpm": FileWatcher, "dest": _DestFile}
@@ -1403,8 +1465,9 @@ def _php_log_watcher(config, logger):
     def register(uuid, conf_name):
         if uuid in registry:
             return
-        _ensure_log_dir(uuid, logger)
-        dest = _DestFile(Path(f"/var/www/{uuid}/logs/php.log"), logger)
+        if not _ensure_site_log_dir(uuid, logger):
+            return
+        dest = _DestFile(_site_log_path(uuid, "php.log"), logger)
         registry[uuid] = {
             "error": FileWatcher(f"/var/www/{uuid}/php-error.log", logger, seek_to_end_on_open=False),
             "fpm":   FileWatcher(f"/var/www/{uuid}/php-fpm.log", logger, seek_to_end_on_open=False),
@@ -1475,9 +1538,9 @@ def _php_log_watcher(config, logger):
         with reg_lock:
             snapshot = list(registry.items())
         for uuid, entry in snapshot:
-            # periodically correct ownership and permissions on log files
+            # periodically re-check the root-owned log directory
             if cycle % 60 == 0:
-                _ensure_log_dir(uuid, logger)
+                _ensure_site_log_dir(uuid, logger)
             for key in ("error", "fpm"):
                 for line in entry[key].readlines():
                     if line.strip():

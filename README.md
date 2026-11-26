@@ -19,8 +19,8 @@ Future Enhance updates might break functionality, although checks are in place t
 - Targeted processing — only modifies files when changes are actually needed
 - Webserver transition detection — monitors for switches between Nginx and OLS and reloads automatically
 - Automatic timestamped backups before any change, with rollback on failure
-- Persistent logging: Per-site webserver access logs written to `/var/www/<UUID>/logs/webserver.log`, for both Nginx and OLS
-- PHP log persistence: Per-site PHP error logs written to `/var/www/<UUID>/logs/php.log`, for both Nginx and OLS
+- Persistent logging: Per-site webserver access logs written to `/var/log/webservertune-enhance/sites/<UUID>/webserver.log` (Nginx; OLS still uses the old location, see Fork notes)
+- PHP log persistence: Per-site PHP error logs written to `/var/log/webservertune-enhance/sites/<UUID>/php.log` (Nginx; OLS still uses the old location, see Fork notes)
 - Cloudflare API health: Monitors all CF-managed domains cluster-wide for zones stuck in `Error` state and automatically re-applies the existing token via the Enhance API. Checks all websites across all servers in the cluster — only needs to run on one server.
 
 ### Nginx
@@ -117,8 +117,8 @@ All settings are controlled through `settings.conf` in TOML format. All features
 |---------|---------|-------------|
 | `log_level` | `INFO` | `DEBUG` (everything), `INFO` (normal operations), `WARNING` (errors only) |
 | `debounce_seconds` | `10` | Seconds to wait after a file change before acting, to avoid reacting to partial writes - increase for servers with more sites |
-| `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/www/<UUID>/logs/webserver.log`. Applies to both Nginx and OLS. |
-| `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/www/<UUID>/logs/php.log`. Applies to both Nginx and OLS. |
+| `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/log/webservertune-enhance/sites/<UUID>/webserver.log` (root:adm, 0750). Nginx only in this fork; do not enable on OLS (see Fork notes). |
+| `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/log/webservertune-enhance/sites/<UUID>/php.log`. Nginx only in this fork; do not enable on OLS (see Fork notes). |
 | `nginx_restart_manage` | `false` | Manages the nginx systemd service restart configuration |
 | `nginx_redirects` | `false` | Sync Enhance UI redirect rules to Nginx include files, per domain |
 | `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
@@ -211,9 +211,9 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 
 ### Persistent Logging
 
-When `persistent_logging` is enabled, access logs are written to `/var/www/<UUID>/logs/webserver.log`. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. When `connection_ip_logging` is enabled, two fields are appended at the end of each Nginx line: the address of the TCP connection before any real IP substitution (`$realip_remote_addr`), and the Cloudflare Ray ID (`$http_cf_ray`, `-` when absent). A request whose connection address is not a Cloudflare IP and has no Ray ID reached the origin directly. The first 12 fields are unchanged, so existing parsers keep working. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
+When `persistent_logging` is enabled, access logs are written to `/var/log/webservertune-enhance/sites/<UUID>/webserver.log`, a root-owned directory (root:adm, 0750) outside the webspace. Vhost lines that still point at the old `/var/www/<UUID>/logs/webserver.log` are migrated automatically. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. When `connection_ip_logging` is enabled, two fields are appended at the end of each Nginx line: the address of the TCP connection before any real IP substitution (`$realip_remote_addr`), and the Cloudflare Ray ID (`$http_cf_ray`, `-` when absent). A request whose connection address is not a Cloudflare IP and has no Ray ID reached the origin directly. The first 12 fields are unchanged, so existing parsers keep working. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
 
-When `persistent_php_logs` is enabled, PHP logs are written to `/var/www/<UUID>/logs/php.log` - php-error.log for both webservers and php-fpm.log for Nginx.
+When `persistent_php_logs` is enabled, PHP logs are written to `/var/log/webservertune-enhance/sites/<UUID>/php.log` - php-error.log for both webservers and php-fpm.log for Nginx. The sources inside the webspace are opened without following symlinks.
 
 ### Log Rotation
 
@@ -221,10 +221,8 @@ If log rotation is desired, create `/etc/logrotate.d/webservertune-enhance` with
 
 ```
 /var/log/webservertune-enhance/*.log
-/var/www/*/logs/webserver.log
-/var/www/*/logs/php.log
-/var/log/nginx/error.log
-/var/log/nginx/access.log
+/var/log/webservertune-enhance/sites/*/webserver.log
+/var/log/webservertune-enhance/sites/*/php.log
 {
    rotate 15
    weekly
@@ -235,7 +233,7 @@ If log rotation is desired, create `/etc/logrotate.d/webservertune-enhance` with
    copytruncate
 }
 ```
-Adjust settings as required, as this config saves 15 weekly logs.
+Adjust settings as required, as this config saves 15 weekly logs. `/var/log/nginx/*.log` is left out because Ubuntu's own `/etc/logrotate.d/nginx` already rotates it (listing a file twice makes logrotate fail).
 
 ## Bugs, feature requests, fixes
 
@@ -254,6 +252,8 @@ This fork is upstream [rdbf/webservertune-enhance](https://github.com/rdbf/webse
 - `connection_ip_logging` for Nginx persistent logs (upstream PR #4)
 - `cms_protection` fix: deny-only rules, so PHP source is no longer served for allowlisted plugins
 - `xmlrpc_protection`: deny `xmlrpc.php` only on WordPress sites without Jetpack, with an allowlist
+- **Security fix: root no longer follows symlinks in tenant webspaces.** `fastcgiclear` reads, writes and re-owns `clear.cache` and the mu-plugin only through `O_NOFOLLOW` directory/file descriptors and checks each file with `fstat` (regular file, one hard link, owned by root or the site user). Nginx persistent and PHP logs moved out of `/var/www/<UUID>/logs/` (which the site user can write, and where the nginx master opened files as root) into `/var/log/webservertune-enhance/sites/<UUID>/`. Regression tests: `python3 -m unittest discover -s tests -v` (run them as root too).
+- **Not yet fixed in this fork — do not enable on OpenLiteSpeed:** `olstune` (persistent/PHP log copies and `_ensure_log_dir` inside `/var/www/<UUID>/logs/`) and `olsredirects` (writes `.htaccess` in the docroot as root) still follow symlinks the same way.
 
 Install from this fork with `git clone https://github.com/andreik6v/webservertune-enhance.git /opt/webservertune-enhance`. Upstream changes are merged into `main` here.
 

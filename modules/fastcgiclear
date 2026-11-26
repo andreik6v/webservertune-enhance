@@ -7,10 +7,11 @@ and clears FastCGI cache directly from the filesystem.
 Called by webservertune-enhance main program.
 """
 
+import errno
 import os
-import pwd
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -31,12 +32,256 @@ _CACHE_PATH_RE = re.compile(r'fastcgi_cache_path\s+(\S+)')
 
 
 # ---------------------------------------------------------------------------
+# Safe file operations inside tenant webspaces
+# ---------------------------------------------------------------------------
+#
+# This service runs as root, but /var/www/<uuid> and everything below it is
+# writable by the website's user (and by any PHP code running on the site).
+# Path-based os.chown / os.chmod / open / shutil.copy2 follow symlinks, so a
+# tenant could point clear.cache, mu-plugins or fastcgiclear.php at a host file
+# and have root overwrite it or hand it to the tenant.
+#
+# Every operation below therefore:
+#   - starts from a directory fd for /var/www/<uuid>. /var/www is root-owned,
+#     so the tenant cannot replace that entry itself;
+#   - opens each further path component relative to the previous fd with
+#     O_NOFOLLOW, so a symlinked component fails with ELOOP/ENOTDIR;
+#   - checks the opened file with fstat (regular file, single hard link,
+#     owned by root or the tenant) before writing, and changes ownership and
+#     mode only through the fd (fchown/fchmod).
+# A tenant who swaps components mid-operation can only make it fail.
+
+_DIR_FLAGS  = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_FILE_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+_FLAG_MAX   = 64
+
+
+class UnsafePath(Exception):
+    """A path inside a webspace is a symlink, not a regular file, or otherwise unsafe."""
+
+
+def www_dir_is_safe():
+    """True if WWW_DIR is a real directory owned by root and not writable by group/other.
+
+    The whole design relies on the tenant being unable to replace /var/www/<uuid>
+    itself, so refuse to operate if that assumption does not hold.
+    """
+    try:
+        st = os.lstat(WWW_DIR)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == 0
+            and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)))
+
+
+def open_webspace(uuid):
+    """Return an O_DIRECTORY fd for WWW_DIR/<uuid> (never follows a symlink)."""
+    if not UUID_RE.fullmatch(uuid or ""):
+        raise UnsafePath(f"invalid webspace name: {uuid!r}")
+    try:
+        return os.open(str(WWW_DIR / uuid), _DIR_FLAGS)
+    except OSError as e:
+        raise UnsafePath(f"cannot open webspace {uuid}: {e}") from e
+
+
+def open_subdir(base_fd, parts):
+    """Open a chain of subdirectories below base_fd without following symlinks.
+
+    Returns a new fd for the last component. The caller closes it.
+    """
+    fd = os.dup(base_fd)
+    try:
+        for part in parts:
+            if part in ("", ".", "..") or "/" in part:
+                raise UnsafePath(f"bad path component: {part!r}")
+            try:
+                nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except OSError as e:
+                raise UnsafePath(f"{part}: {e}") from e
+            os.close(fd)
+            fd = nfd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _check_regular(fd, name, allowed_uids):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise UnsafePath(f"{name}: not a regular file")
+    if st.st_nlink != 1:
+        raise UnsafePath(f"{name}: has {st.st_nlink} hard links")
+    if allowed_uids is not None and st.st_uid not in allowed_uids:
+        raise UnsafePath(f"{name}: owned by uid {st.st_uid}")
+    return st
+
+
+def read_small(dir_fd, name, limit=_FLAG_MAX):
+    """Read up to `limit` bytes of a regular file in dir_fd. Refuses symlinks, FIFOs, devices."""
+    try:
+        fd = os.open(name, os.O_RDONLY | _FILE_FLAGS, dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return None
+        raise UnsafePath(f"{name}: {e}") from e
+    try:
+        _check_regular(fd, name, None)
+        return os.read(fd, limit).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def write_owned(dir_fd, name, data, uid, gid, mode=0o644):
+    """Create or replace the content of a regular file in dir_fd and give it to uid:gid.
+
+    Never follows a symlink, never writes to a FIFO/device or a multiply-linked file,
+    and only touches files already owned by root or by uid.
+    """
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | _FILE_FLAGS, mode, dir_fd=dir_fd)
+    except OSError as e:
+        raise UnsafePath(f"{name}: {e}") from e
+    try:
+        _check_regular(fd, name, {0, uid})
+        os.ftruncate(fd, 0)
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def webspace_owner(ws_fd):
+    """(uid, gid) of the webspace directory, read from its fd."""
+    st = os.fstat(ws_fd)
+    return st.st_uid, st.st_gid
+
+
+def ensure_flag_file(uuid):
+    """Create clear.cache if absent, owned by the webspace user. Returns True if handled."""
+    ws = open_webspace(uuid)
+    try:
+        uid, gid = webspace_owner(ws)
+        if uid == 0:
+            raise UnsafePath(f"webspace {uuid} is owned by root")
+        if read_small(ws, FLAG_FILE) is None:
+            write_owned(ws, FLAG_FILE, b"cache=cleared\n", uid, gid)
+            return True
+        # exists: only fix ownership/mode, through a checked fd
+        fd = os.open(FLAG_FILE, os.O_RDONLY | _FILE_FLAGS, dir_fd=ws)
+        try:
+            st = _check_regular(fd, FLAG_FILE, {0, uid})
+            if st.st_uid != uid or st.st_gid != gid:
+                os.fchown(fd, uid, gid)
+            if (st.st_mode & 0o777) != 0o644:
+                os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+        return True
+    finally:
+        os.close(ws)
+
+
+def read_flag(uuid):
+    """Return the stripped content of clear.cache, or None if absent/unsafe."""
+    ws = open_webspace(uuid)
+    try:
+        content = read_small(ws, FLAG_FILE)
+        return content.strip() if content is not None else None
+    finally:
+        os.close(ws)
+
+
+def write_flag_cleared(uuid):
+    """Reset clear.cache to cache=cleared, owned by the webspace user."""
+    ws = open_webspace(uuid)
+    try:
+        uid, gid = webspace_owner(ws)
+        if uid == 0:
+            raise UnsafePath(f"webspace {uuid} is owned by root")
+        write_owned(ws, FLAG_FILE, b"cache=cleared\n", uid, gid)
+    finally:
+        os.close(ws)
+
+
+def find_wp_roots(uuid):
+    """Relative path parts of every WordPress root in the webspace.
+
+    Walks without following symlinked directories and does not descend into
+    wp-content. A tenant can still make this list wrong, but every write
+    afterwards re-opens the components with O_NOFOLLOW.
+    """
+    base  = str(WWW_DIR / uuid)
+    roots = []
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d != "wp-content"]
+        if "wp-config.php" in filenames and "wp-content" in os.listdir(dirpath):
+            rel = os.path.relpath(dirpath, base)
+            roots.append([] if rel == "." else rel.split(os.sep))
+    return roots
+
+
+def deploy_mu_plugin(uuid, plugin_bytes):
+    """Install plugin_bytes as wp-content/mu-plugins/fastcgiclear.php in every WordPress root.
+
+    Returns a list of (relative_path, ok, message).
+    """
+    results = []
+    ws = open_webspace(uuid)
+    try:
+        uid, gid = webspace_owner(ws)
+        if uid == 0:
+            raise UnsafePath(f"webspace {uuid} is owned by root")
+        for parts in find_wp_roots(uuid):
+            label = "/".join(parts + ["wp-content", "mu-plugins", MU_PLUGIN_NAME])
+            try:
+                wpc = open_subdir(ws, parts + ["wp-content"])
+                try:
+                    created = False
+                    try:
+                        os.mkdir("mu-plugins", 0o755, dir_fd=wpc)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    mu = open_subdir(wpc, ["mu-plugins"])
+                    try:
+                        st = os.fstat(mu)
+                        # take ownership only of a directory we created or one root left
+                        # behind; never re-own a directory belonging to someone else
+                        if created or st.st_uid == 0:
+                            os.fchown(mu, uid, gid)
+                            os.fchmod(mu, 0o755)
+                        elif st.st_uid != uid:
+                            raise UnsafePath(f"mu-plugins owned by uid {st.st_uid}")
+                        write_owned(mu, MU_PLUGIN_NAME, plugin_bytes, uid, gid)
+                    finally:
+                        os.close(mu)
+                finally:
+                    os.close(wpc)
+                results.append((label, True, "deployed"))
+            except (UnsafePath, OSError) as e:
+                results.append((label, False, str(e)))
+    finally:
+        os.close(ws)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def watch(config, logger):
     """Entry point called by main program."""
     logger.info("fastcgiclear starting")
+
+    if not www_dir_is_safe():
+        logger.error(f"{WWW_DIR} is not a root-owned directory without group/other write; "
+                     "refusing to manage webspaces")
+        return
 
     general       = config.get("general", {})
     debounce_secs = general.get("debounce_seconds", 10)
@@ -53,32 +298,12 @@ def watch(config, logger):
     # Helpers
     # ---------------------------------------------------------------------------
 
-    def _get_webspace_pw(uuid):
-        """Return pwd entry for the system user owning the webspace directory."""
-        try:
-            stat = os.stat(WWW_DIR / uuid)
-            return pwd.getpwuid(stat.st_uid)
-        except Exception:
-            return None
-
     def _ensure_flag_file(uuid):
         """Create the flag file if absent, and correct ownership/permissions if wrong."""
-        flag = WWW_DIR / uuid / FLAG_FILE
-        pw   = _get_webspace_pw(uuid)
-        if pw is None:
-            return
         try:
-            if not flag.exists():
-                flag.write_text("cache=cleared\n")
-                os.chown(flag, pw.pw_uid, pw.pw_gid)
-                os.chmod(flag, 0o644)
-                logger.debug(f"[{uuid}] Created {FLAG_FILE}")
-            else:
-                st = os.stat(flag)
-                if st.st_uid != pw.pw_uid or st.st_gid != pw.pw_gid:
-                    os.chown(flag, pw.pw_uid, pw.pw_gid)
-                if (st.st_mode & 0o777) != 0o644:
-                    os.chmod(flag, 0o644)
+            ensure_flag_file(uuid)
+        except UnsafePath as e:
+            logger.warning(f"[{uuid}] Refusing to touch {FLAG_FILE}: {e}")
         except Exception as e:
             logger.error(f"[{uuid}] Failed to ensure {FLAG_FILE}: {e}")
 
@@ -87,31 +312,24 @@ def watch(config, logger):
         Deploy the mu-plugin to every WordPress install found in the webspace.
         Skips wp-config.php files inside wp-content to avoid false matches.
         """
-        if not MU_PLUGIN_SRC.exists():
+        try:
+            plugin_bytes = MU_PLUGIN_SRC.read_bytes()
+        except OSError:
             logger.warning(f"mu-plugin source not found: {MU_PLUGIN_SRC}")
             return
-        pw = _get_webspace_pw(uuid)
-        if pw is None:
+        try:
+            results = deploy_mu_plugin(uuid, plugin_bytes)
+        except UnsafePath as e:
+            logger.warning(f"[{uuid}] Refusing to deploy mu-plugin: {e}")
             return
-        uuid_dir = WWW_DIR / uuid
-        for wp_config in uuid_dir.rglob("wp-config.php"):
-            if "wp-content" in wp_config.parts:
-                continue
-            wp_root = wp_config.parent
-            if not (wp_root / "wp-content").is_dir():
-                continue
-            mu_dir = wp_root / "wp-content" / "mu-plugins"
-            dest   = mu_dir / MU_PLUGIN_NAME
-            try:
-                mu_dir.mkdir(parents=True, exist_ok=True)
-                os.chown(mu_dir, pw.pw_uid, pw.pw_gid)
-                os.chmod(mu_dir, 0o755)
-                shutil.copy2(MU_PLUGIN_SRC, dest)
-                os.chown(dest, pw.pw_uid, pw.pw_gid)
-                os.chmod(dest, 0o644)
-                logger.info(f"[{uuid}] Deployed mu-plugin to {dest}")
-            except Exception as e:
-                logger.error(f"[{uuid}] Failed to deploy mu-plugin to {dest}: {e}")
+        except Exception as e:
+            logger.error(f"[{uuid}] Failed to deploy mu-plugin: {e}")
+            return
+        for label, ok, msg in results:
+            if ok:
+                logger.info(f"[{uuid}] Deployed mu-plugin to {label}")
+            else:
+                logger.warning(f"[{uuid}] Refusing to deploy mu-plugin to {label}: {msg}")
 
     def _handle_uuid(uuid):
         """Register a new webspace UUID, set up its flag file, and deploy the mu-plugin."""
@@ -189,14 +407,11 @@ def watch(config, logger):
             except Exception as e:
                 logger.error(f"[{uuid}] Failed to clear cache dir {cache_dir}: {e}")
 
-        flag = WWW_DIR / uuid / FLAG_FILE
-        pw   = _get_webspace_pw(uuid)
         try:
-            flag.write_text("cache=cleared\n")
-            if pw:
-                os.chown(flag, pw.pw_uid, pw.pw_gid)
-            os.chmod(flag, 0o644)
+            write_flag_cleared(uuid)
             logger.debug(f"[{uuid}] Wrote cache=cleared")
+        except UnsafePath as e:
+            logger.warning(f"[{uuid}] Refusing to reset {FLAG_FILE}: {e}")
         except Exception as e:
             logger.error(f"[{uuid}] Failed to write cache=cleared: {e}")
 
@@ -256,9 +471,11 @@ def watch(config, logger):
                 if not m:
                     continue
                 uuid = m.group(0)
-                flag = WWW_DIR / uuid / FLAG_FILE
                 try:
-                    content = flag.read_text().strip()
+                    content = read_flag(uuid)
+                except UnsafePath as e:
+                    logger.warning(f"[{uuid}] Ignoring unsafe {FLAG_FILE}: {e}")
+                    continue
                 except Exception:
                     continue
                 if content != "cache=stale":
@@ -293,11 +510,12 @@ def watch(config, logger):
         with uuid_lock:
             snapshot = set(known_uuids)
         for uuid in snapshot:
-            flag = WWW_DIR / uuid / FLAG_FILE
             try:
-                if flag.exists() and flag.read_text().strip() == "cache=stale":
+                if read_flag(uuid) == "cache=stale":
                     logger.info(f"[{uuid}] Startup: stale cache flag found")
                     _schedule_clear(uuid)
+            except UnsafePath as e:
+                logger.warning(f"[{uuid}] Ignoring unsafe {FLAG_FILE}: {e}")
             except Exception:
                 pass
 
