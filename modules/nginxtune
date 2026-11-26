@@ -39,8 +39,13 @@ DEFAULT_WORKER_USER = "www-data"
 
 # Any access_log directive writing below /var/www (quoted or not, any whitespace,
 # spanning lines). Removed from every vhost: the nginx master would open it as root.
-_WEBSPACE_LOG_LINE_RE   = re.compile(r'(?m)^[ \t]*access_log\s+["\']?/var/www/[^;]*;[ \t]*(?:\r?\n)?')
-_WEBSPACE_LOG_INLINE_RE = re.compile(r'(?<![\w$])access_log\s+["\']?/var/www/[^;]*;')
+# Comments are matched first and kept as they are, so a commented-out line without
+# a ';' can never make the match run into the following directives.
+_WEBSPACE_LOG_RE = re.compile(
+    r'(#[^\n]*)'
+    r'|^[ \t]*access_log\s+["\']?/var/www/[^;#]*;[ \t]*(?:\r?\n)?'
+    r'|(?<![\w$])access_log\s+["\']?/var/www/[^;#]*;',
+    re.MULTILINE)
 
 
 def _site_log_path(uuid, name):
@@ -65,9 +70,15 @@ def _enhance_log_uuid(s):
 
 def _strip_webspace_logs(text):
     """Remove every access_log directive pointing below /var/www. Returns (text, removed)."""
-    text, n1 = _WEBSPACE_LOG_LINE_RE.subn("", text)
-    text, n2 = _WEBSPACE_LOG_INLINE_RE.subn("", text)
-    return text, n1 + n2
+    removed = 0
+
+    def repl(m):
+        nonlocal removed
+        if m.group(1) is not None:
+            return m.group(1)
+        removed += 1
+        return ""
+    return _WEBSPACE_LOG_RE.sub(repl, text), removed
 
 
 NGINX_DROPIN  = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
@@ -953,6 +964,8 @@ def apply_logging_features(config, logger):
 
         for line in lines:
             s = line.strip()
+            if s.startswith("#"):
+                continue
             if s.startswith("log_format") and not s.endswith(";"):
                 fmts_single = False
             if _is_current_pers_log_line(s):
@@ -995,7 +1008,7 @@ def apply_logging_features(config, logger):
             expected = _persistent_log_format(base_fmt, ip_var, conn_ip_on).strip()
             for line in lines:
                 s = line.strip()
-                if "log_format" in s and "_persistent" in s:
+                if not s.startswith("#") and "log_format" in s and "_persistent" in s:
                     if s != expected:
                         pers_fmt_correct = False
                     break
@@ -1026,7 +1039,11 @@ def apply_logging_features(config, logger):
             s    = line.strip()
             base = _indent(lines, i)
 
-            if not realip_on and "map $http_cf_connecting_ip $actual_addr" in s:
+            if s.startswith("#"):
+                new_lines.append(line)      # comments are never interpreted or changed
+                continue
+
+            elif not realip_on and "map $http_cf_connecting_ip $actual_addr" in s:
                 continue
 
             # always strip the persistent log line — re-added below to prevent duplicates
@@ -1127,10 +1144,10 @@ def _grant_worker_traverse(path, logger):
     except OSError as e:
         logger.error(f"setfacl: cannot stat {path}: {e}")
         return False
-    key = (str(path), st.st_dev, st.st_ino)
+    user = _nginx_worker_user()
+    key = (str(path), st.st_dev, st.st_ino, user)
     if key in _acl_done:
         return True
-    user = _nginx_worker_user()
     try:
         r = subprocess.run(["setfacl", "-m", f"u:{user}:x", "--", str(path)],
                            capture_output=True, text=True, timeout=10)

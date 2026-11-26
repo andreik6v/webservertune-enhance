@@ -7,6 +7,7 @@ and clears FastCGI cache directly from the filesystem.
 Called by webservertune-enhance main program.
 """
 
+import collections
 import errno
 import os
 import re
@@ -247,9 +248,11 @@ def find_wp_roots(ws_fd):
     Returns (roots, note) where note explains an early stop, or None.
     """
     roots, note = [], None
-    stack, visited, examined = [[]], 0, 0
-    while stack and note is None:
-        parts = stack.pop()
+    # breadth-first, so shallow directories such as public_html are always
+    # searched before a huge tree deeper down can exhaust the limits
+    queue, visited, examined = collections.deque([[]]), 0, 0
+    while queue and note is None:
+        parts = queue.popleft()
         visited += 1
         if visited > WALK_MAX_DIRS:
             note = f"stopped after {WALK_MAX_DIRS} directories"
@@ -287,10 +290,10 @@ def find_wp_roots(ws_fd):
                 note = f"stopped after {WALK_MAX_ROOTS} WordPress roots"
                 break
         if len(parts) < WALK_MAX_DEPTH:
-            for name in sorted(set(dirs) - {"wp-content"}, reverse=True):
-                if len(stack) >= WALK_MAX_DIRS:
+            for name in sorted(set(dirs) - {"wp-content"}):
+                if len(queue) >= WALK_MAX_DIRS:
                     break
-                stack.append(parts + [name])
+                queue.append(parts + [name])
     return roots, note
 
 

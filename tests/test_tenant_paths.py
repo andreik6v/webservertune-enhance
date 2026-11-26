@@ -335,6 +335,15 @@ class FastcgiclearTests(unittest.TestCase):
         os.chmod(croot, 0o755)
 
 
+    def test_walk_is_breadth_first(self):
+        # a huge tree that sorts first must not hide a shallow WordPress root
+        for i in range(30):
+            (self.ws / "zzz-backups" / f"d{i}" / "x").mkdir(parents=True)
+        self.wp("public_html")
+        self._with(WALK_MAX_DIRS=10)
+        res, note = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertEqual([r[0] for r in res], ["public_html/wp-content/mu-plugins/fastcgiclear.php"])
+
     def test_walk_entry_limit(self):
         for i in range(5):
             (self.ws / f"d{i}").mkdir()
@@ -658,6 +667,27 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.conf.write_text(text.replace(fmt, fmt + fmt))
         text = self.settle(self.cfg(True))
         self.assertEqual(text.count("log_format example.com_persistent"), 1)
+
+    def test_comment_without_semicolon_does_not_eat_directives(self):
+        c = VHOST.replace("server {\nlisten 80;",
+                          f"# old access_log /var/www/{UUID}/logs/webserver.log\nserver {{\nlisten 80;")
+        self.conf.write_text(c)
+        for pers in (True, False):
+            text = self.settle(self.cfg(pers))
+            self.assertIn("server {\nlisten 80;", text)
+            self.assertIn(f"# old access_log /var/www/{UUID}/logs/webserver.log\n", text)
+            self.assertNotRegex(text, r"(?m)^\s*access_log\s+[\"']?/var/www")
+
+    def test_commented_directives_are_ignored(self):
+        c = VHOST.replace("server {\n",
+                          "server {\n# log_format old \"$remote_addr\";\n"
+                          f"# access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log old;\n")
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(True))
+        self.assertIn('# log_format old "$remote_addr";\n', text)
+        self.assertEqual(text.count("log_format example.com_persistent"), 1)
+        self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
+        self.assertNotIn("old_persistent", text)
 
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code
