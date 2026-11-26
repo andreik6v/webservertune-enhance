@@ -80,6 +80,9 @@ class FastcgiclearTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.www = self.tmp / "www"
         self.www.mkdir()
+        # like production: /var/www is 0711, so the site user can reach its webspace
+        os.chmod(self.tmp, 0o711)
+        os.chmod(self.www, 0o711)
         fcc.WWW_DIR = self.www
         self.ws = self.www / UUID
         self.ws.mkdir()
@@ -332,6 +335,87 @@ class FastcgiclearTests(unittest.TestCase):
         os.chmod(croot, 0o755)
 
 
+    def test_walk_entry_limit(self):
+        for i in range(5):
+            (self.ws / f"d{i}").mkdir()
+        give_to_tenant(self.ws)
+        self._with(WALK_MAX_ENTRIES=3)
+        res, note = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertIn("entries", note)
+
+    def test_mkdir_as_other_user_refused_unprivileged(self):
+        if AS_ROOT:
+            self.skipTest("unprivileged only")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc._mkdir_as(self.ws / "x", os.geteuid() + 1, os.getegid())
+        self.assertFalse((self.ws / "x").exists())
+
+    def test_find_cache_paths_matches_enhance_log_only(self):
+        sites = self.tmp / "sites-enabled"
+        sites.mkdir()
+        self._with(SITES_DIR=sites)
+        other = "99999999-2222-3333-4444-555555555555"
+        (sites / "a.conf").write_text(
+            "fastcgi_cache_path /c/a levels=1:2 keys_zone=a:10m;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
+        (sites / "a-preview.conf").write_text(
+            "fastcgi_cache_path /c/ap levels=1:2 keys_zone=ap:10m;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log ap;\n")
+        (sites / "b.conf").write_text(
+            f"# moved from {UUID}\nroot /var/www/{UUID}/x;\n"
+            "fastcgi_cache_path /c/b levels=1:2 keys_zone=b:10m;\n"
+            f"access_log /var/local/enhance/webserver_logs/{other}.log b;\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/ap"])
+
+    def test_clear_cache_dir_empties_without_following_links(self):
+        c = self.tmp / "cache"
+        (c / "1" / "ab").mkdir(parents=True)
+        (c / "1" / "ab" / "key").write_text("x")
+        (c / "f").write_text("x")
+        (c / "link").symlink_to(self.v.dir)
+        (c / "1" / "dlink").symlink_to(self.v.dir)
+        self.assertEqual(fcc.clear_cache_dir(c), [])
+        self.assertEqual(os.listdir(c), [])
+        self.v.assert_untouched(self)
+
+    def test_clear_cache_dir_vanished_entries_are_not_errors(self):
+        # nginx's cache manager can expire entries while we delete; simulate the
+        # error rmtree reports then, and a real failure for comparison
+        c = self.tmp / "cache"
+        (c / "1" / "ab").mkdir(parents=True)
+        real = fcc.shutil.rmtree
+
+        def fake(exc_type):
+            def rmtree(path, onexc=None, onerror=None):
+                real(path)
+                exc = exc_type(2, "simulated", path)
+                if onexc:
+                    onexc(os.unlink, path, exc)
+                else:
+                    onerror(os.unlink, path, (exc_type, exc, None))
+            return rmtree
+        try:
+            fcc.shutil.rmtree = fake(FileNotFoundError)
+            self.assertEqual(fcc.clear_cache_dir(c), [])
+            (c / "2").mkdir()
+            fcc.shutil.rmtree = fake(PermissionError)
+            self.assertEqual(len(fcc.clear_cache_dir(c)), 1)
+        finally:
+            fcc.shutil.rmtree = real
+
+    def test_clear_cache_dir_reports_failures(self):
+        if AS_ROOT:
+            self.skipTest("root ignores permissions")
+        c = self.tmp / "cache"
+        (c / "locked").mkdir(parents=True)
+        (c / "locked" / "f").write_text("x")
+        os.chmod(c / "locked", 0o500)
+        try:
+            self.assertTrue(fcc.clear_cache_dir(c))
+        finally:
+            os.chmod(c / "locked", 0o700)
+
+
 def ngx_env(tmp):
     """Point nginxtune at a temp tree; the worker user is nobody (exists everywhere)."""
     (tmp / "nginx.conf").write_text("user nobody;\nworker_processes auto;\n")
@@ -541,6 +625,39 @@ class NginxtuneMigrationTests(unittest.TestCase):
         m1 = os.stat(self.conf).st_mtime_ns
         self.assertFalse(ngx.apply_logging_features(self.cfg(True), LOG))
         self.assertEqual(os.stat(self.conf).st_mtime_ns, m1)
+
+    def test_multiline_log_format_gets_no_persistent_lines(self):
+        ml = VHOST.replace('log_format example.com "\\"$remote_addr\\" \\"$msec\\"";',
+                           'log_format example.com "\\"$remote_addr\\""\n    "\\"$msec\\"";')
+        self.assertIn('\n    "', ml)
+        self.conf.write_text(ml)
+        text = self.settle(self.cfg(True))
+        self.assertNotIn("_persistent", text)
+        self.assertIn('\n    "', text)
+
+    def test_every_enhance_log_gets_its_persistent_line(self):
+        two = VHOST.replace("include vhost_includes/example.com.conf;\n}\n",
+            "include vhost_includes/example.com.conf;\n}\nserver {\nlisten 443;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log example.com;\n}}\n")
+        self.conf.write_text(two)
+        text = self.settle(self.cfg(True))
+        self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 2)
+        self.assertEqual(text.count("log_format example.com_persistent"), 1)
+
+    def test_wrong_destination_is_corrected(self):
+        other = "99999999-2222-3333-4444-555555555555"
+        self.settle(self.cfg(True))
+        self.conf.write_text(self.conf.read_text().replace(f"{UUID}/webserver.log", f"{other}/webserver.log"))
+        text = self.settle(self.cfg(True))
+        self.assertNotIn(other, text)
+        self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
+
+    def test_duplicate_persistent_format_reduced(self):
+        text = self.settle(self.cfg(True))
+        fmt = [l for l in text.splitlines(keepends=True) if "log_format example.com_persistent" in l][0]
+        self.conf.write_text(text.replace(fmt, fmt + fmt))
+        text = self.settle(self.cfg(True))
+        self.assertEqual(text.count("log_format example.com_persistent"), 1)
 
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code
