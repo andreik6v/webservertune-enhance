@@ -497,7 +497,8 @@ class FastcgiclearTests(unittest.TestCase):
 
         def fake(exc_type):
             def rmtree(path, onexc=None, onerror=None):
-                real(path)
+                if os.path.lexists(path):
+                    real(path)
                 exc = exc_type(2, "simulated", path)
                 if onexc:
                     onexc(os.unlink, path, exc)
@@ -543,6 +544,43 @@ class FastcgiclearTests(unittest.TestCase):
         (croot / "b.eu").symlink_to(self.v.dir)
         self.assertFalse(fcc.clear_site_cache(UUID, LOG))
         self.v.assert_untouched(self)
+
+    def test_clear_cache_dir_retries_a_bucket_nginx_wrote_into(self):
+        c = self.tmp / "cache"
+        (c / "a" / "0f").mkdir(parents=True)
+        real, calls = fcc.shutil.rmtree, []
+
+        def rmtree(path, onexc=None, onerror=None):
+            calls.append(path)
+            if len(calls) == 1:          # first removal: nginx wrote a new entry meanwhile
+                exc = OSError(errno.ENOTEMPTY, "simulated", path)
+                (onexc(os.rmdir, path, exc) if onexc else onerror(os.rmdir, path, (OSError, exc, None)))
+                return
+            real(path)
+        fcc.shutil.rmtree = rmtree
+        try:
+            self.assertEqual(fcc.clear_cache_dir(c), [])
+        finally:
+            fcc.shutil.rmtree = real
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(os.listdir(c), [])
+
+    def test_clear_site_cache_skips_dirs_done_earlier(self):
+        sites = self.tmp / "sites-enabled"
+        sites.mkdir()
+        croot = self.tmp / "nginx_cache"
+        croot.mkdir()
+        os.chmod(croot, 0o755)
+        self._with(SITES_DIR=sites, TRUSTED_CACHE_ROOT=croot)
+        (sites / "a.conf").write_text(f"fastcgi_cache_path {croot}/a.eu keys_zone=a:1m;\n"
+                                      f"access_log /var/local/enhance/webserver_logs/{UUID}.log a;\n")
+        (croot / "a.eu" / "1").mkdir(parents=True)
+        done = set()
+        self.assertTrue(fcc.clear_site_cache(UUID, LOG, done))
+        self.assertEqual(done, {croot / "a.eu"})
+        (croot / "a.eu" / "new").mkdir()          # refilled after the first attempt
+        self.assertTrue(fcc.clear_site_cache(UUID, LOG, done))
+        self.assertTrue((croot / "a.eu" / "new").exists())
 
     def test_clear_cache_dir_reports_failures(self):
         if AS_ROOT:

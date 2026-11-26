@@ -1470,7 +1470,9 @@ def _extract_uuid_from_conf(cf):
     try:
         for d in nc.parse(cf.read_text()):
             if _is_enhance_log(d):
-                return _enhance_log_uuid(d.args[0])
+                u = _enhance_log_uuid(d.args[0])
+                if u:
+                    return u
     except Exception:
         pass
     return None

@@ -70,8 +70,9 @@ WALK_MAX_ENTRIES = 500000   # directory entries examined in total
 
 # FastCGI cache directories are only ever deleted below this root-owned path.
 TRUSTED_CACHE_ROOT = Path("/var/nginx_cache")
-CLEAR_ATTEMPTS   = 3
-CLEAR_RETRY_SECS = 1
+CLEAR_ATTEMPTS     = 3    # whole-site attempts (e.g. a vhost being regenerated)
+CLEAR_RETRY_SECS   = 1
+CLEAR_BUCKET_TRIES = 5    # immediate re-removals of a hash dir nginx wrote into
 
 
 class UnsafePath(Exception):
@@ -453,23 +454,41 @@ def find_cache_paths(uuid):
     return paths
 
 
+def _rmtree_errors(path):
+    """rmtree path without following links; returns [(errno, message)] for every
+    failure except entries that vanished (nginx's cache manager expiring them)."""
+    errors = []
+
+    def onexc(func, p, exc):
+        if isinstance(exc, FileNotFoundError):
+            return
+        errors.append((getattr(exc, "errno", None), f"{p}: {exc}"))
+
+    def onerror(func, p, info):
+        onexc(func, p, info[1])
+
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=onexc)
+        else:
+            shutil.rmtree(path, onerror=onerror)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        errors.append((e.errno, f"{path}: {e}"))
+    return errors
+
+
 def clear_cache_dir(cache_dir):
     """Empty a trusted cache directory. Returns a list of errors.
 
     nginx keeps working on the cache meanwhile. Entries its cache manager
     expires disappear (ENOENT), which is fine. A response can also be cached
-    into a hash directory just before it is removed (ENOTEMPTY); that entry
-    may predate the content change, so it is an error and the caller retries."""
+    into a hash directory that was already emptied, so removing its parent
+    fails with ENOTEMPTY. That entry may predate the content change, so the
+    hash directory is removed again at once (it then holds only the few new
+    files); if it still fails, that is an error and the caller retries."""
     errors = []
-
-    def onexc(func, path, exc):
-        if isinstance(exc, FileNotFoundError):
-            return
-        errors.append(f"{path}: {exc}")
-
-    def onerror(func, path, info):
-        onexc(func, path, info[1])
-
     try:
         with os.scandir(cache_dir) as it:
             entries = list(it)
@@ -477,23 +496,32 @@ def clear_cache_dir(cache_dir):
         return [f"{cache_dir}: {e}"]
     for entry in entries:
         try:
-            if entry.is_dir(follow_symlinks=False):
-                if sys.version_info >= (3, 12):
-                    shutil.rmtree(entry.path, onexc=onexc)
-                else:
-                    shutil.rmtree(entry.path, onerror=onerror)
-            else:
-                os.unlink(entry.path)
-        except FileNotFoundError:
-            pass
+            is_dir = entry.is_dir(follow_symlinks=False)
         except OSError as e:
             errors.append(f"{entry.path}: {e}")
+            continue
+        if not is_dir:
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                errors.append(f"{entry.path}: {e}")
+            continue
+        for _ in range(CLEAR_BUCKET_TRIES):
+            errs = _rmtree_errors(entry.path)
+            if not errs or any(code != errno.ENOTEMPTY for code, _ in errs):
+                break
+        errors.extend(msg for _, msg in errs)
     return errors
 
 
-def clear_site_cache(uuid, logger):
+def clear_site_cache(uuid, logger, done=None):
     """One attempt at emptying every cache dir of the webspace. True only if all
-    of them are known and were emptied completely (or do not exist yet)."""
+    of them are known and were emptied completely (or do not exist yet).
+    Directories in `done` (emptied by an earlier attempt) are not emptied again;
+    successfully emptied ones are added to it."""
+    done = set() if done is None else done
     try:
         cache_paths = find_cache_paths(uuid)
     except Exception as e:
@@ -519,7 +547,11 @@ def clear_site_cache(uuid, logger):
                            f"directly below {TRUSTED_CACHE_ROOT}")
             ok = False
             continue
+        if cache_dir in done:
+            continue
         errors = clear_cache_dir(cache_dir)
+        if not errors:
+            done.add(cache_dir)
         if errors:
             ok = False
             logger.warning(f"[{uuid}] Cache dir {cache_dir} only partly cleared "
@@ -646,8 +678,9 @@ def watch(config, logger):
         flag. Retried a few times because nginx keeps using the cache meanwhile;
         the flag is only reset after a complete clear."""
         logger.info(f"[{uuid}] Clearing FastCGI cache")
+        done = set()
         for attempt in range(1, CLEAR_ATTEMPTS + 1):
-            if clear_site_cache(uuid, logger):
+            if clear_site_cache(uuid, logger, done):
                 break
             if attempt < CLEAR_ATTEMPTS:
                 time.sleep(CLEAR_RETRY_SECS)
