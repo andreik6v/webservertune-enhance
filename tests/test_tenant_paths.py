@@ -373,6 +373,8 @@ class FastcgiclearTests(unittest.TestCase):
                 fcc._mkdir_as(fd, "x", os.geteuid() + 1)
             with self.assertRaises(fcc.UnsafePath):
                 fcc._mkdir_as(fd, "../x", os.geteuid())
+            with self.assertRaises(fcc.UnsafePath):
+                fcc._mkdir_as(fd, "x", 0)
         finally:
             os.close(fd)
         self.assertFalse((self.ws / "x").exists())
@@ -431,6 +433,17 @@ class FastcgiclearTests(unittest.TestCase):
             "fastcgi_cache_path \"/c/a p\" levels=1:2 keys_zone=ap:10m;\n"
             f"access_log /var/local/enhance/webserver_logs/{UUID}.log ap;\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        # an alias vhost of the same webspace with caching off has no cache zone
+        (sites / "alias.conf").write_text(
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        # a directive that cannot be parsed is not silently truncated
+        (sites / "alias.conf").write_text(
+            "fastcgi_cache_path /c/al\"x levels=1:2;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "alias.conf")
         (sites / "two.conf").write_text(
             "fastcgi_cache_path /c/x levels=1:2 keys_zone=x:10m;\n"
             "fastcgi_cache_path /c/y levels=1:2 keys_zone=y:10m;\n"
@@ -788,6 +801,14 @@ class NginxtuneMigrationTests(unittest.TestCase):
         for pers in (True, False):
             self.assertFalse(ngx.apply_logging_features(self.cfg(pers), LOG))
             self.assertEqual(self.conf.read_text(), ml)
+
+    def test_mid_word_quote_is_not_a_string(self):
+        c = VHOST.replace("listen 80;", "listen 80;\nrewrite ^/don't-go$ /go permanent;\nlocation /a#b { return 204; }")
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(True))
+        self.assertIn("rewrite ^/don't-go$ /go permanent;", text)
+        self.assertIn("location /a#b { return 204; }", text)
+        self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
 
     def test_log_format_with_trailing_comment_supported(self):
         c = VHOST.replace('\\"$msec\\"";', '\\"$msec\\""; # main format')

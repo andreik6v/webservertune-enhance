@@ -58,20 +58,27 @@ def _is_current_pers_log_line(s):
 
 def _code_part(line):
     """(balanced, code): the line without a trailing comment, and whether every
-    quote opened on it is closed on it (backslash escapes honoured)."""
-    q, esc = None, False
+    quote opened on it is closed on it. Like nginx's tokenizer, a quote or '#'
+    only opens a string/comment at the start of a token; backslashes escape."""
+    q, esc, word_start = None, False, True
     for i, ch in enumerate(line):
         if esc:
             esc = False
+            word_start = False
         elif ch == "\\":
             esc = True
         elif q:
             if ch == q:
                 q = None
-        elif ch in "\"'":
+        elif ch.isspace() or ch in ";{}":
+            word_start = True
+        elif word_start and ch in "\"'":
             q = ch
-        elif ch == "#":
+            word_start = False
+        elif word_start and ch == "#":
             return True, line[:i]
+        else:
+            word_start = False
     return q is None, line
 
 

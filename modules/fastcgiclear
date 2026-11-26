@@ -31,7 +31,8 @@ UUID_RE = re.compile(
     re.IGNORECASE
 )
 
-_CACHE_PATH_RE = re.compile(r'''(?<![\w$])fastcgi_cache_path\s+(?:"([^"]+)"|'([^']+)'|([^\s"';]+))''')
+_CACHE_PATH_RE = re.compile(r'''(?<![\w$])fastcgi_cache_path\s+(?:"([^"]+)"|'([^']+)'|([^\s"';]+))(?=\s|;|$)''')
+_CACHE_DIRECTIVE_RE = re.compile(r'(?<![\w$])fastcgi_cache_path(?=\s|;|$)')
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +323,10 @@ def _mkdir_as(dir_fd, name, uid):
     """
     if "/" in name or name in ("", ".", ".."):
         raise UnsafePath(f"bad directory name: {name!r}")
+    if uid == 0:
+        raise UnsafePath("refusing to act as root for a webspace")
+    if os.fstat(dir_fd).st_uid != uid:
+        raise UnsafePath("parent directory is not owned by the site user")
     if os.geteuid() == 0:
         try:
             gid = pwd.getpwuid(uid).pw_gid
@@ -335,6 +340,7 @@ def _mkdir_as(dir_fd, name, uid):
     try:
         r = subprocess.run([sys.executable, "-I", "-S", "-c", _MKDIR_CHILD, str(dir_fd), name],
                            pass_fds=(dir_fd,), cwd="/", env={"LC_ALL": "C"},
+                           stdin=subprocess.DEVNULL,
                            capture_output=True, timeout=5, **creds)
     except subprocess.TimeoutExpired:
         # the child runs as the site user, who can stop it; never wait long
@@ -411,13 +417,16 @@ def find_cache_paths(uuid):
         for line in content.splitlines():
             if line.strip().startswith("#"):
                 continue
-            for m in _CACHE_PATH_RE.finditer(line):
-                found.append(Path(next(g for g in m.groups() if g)))
-        # Enhance writes one vhost file per domain with exactly one cache zone;
-        # anything else is ambiguous, and nothing is cleared rather than guessed
-        if len(found) != 1:
+            parsed = [Path(next(g for g in m.groups() if g)) for m in _CACHE_PATH_RE.finditer(line)]
+            if len(parsed) != len(_CACHE_DIRECTIVE_RE.findall(line)):
+                raise UnsafePath(f"{cf.name} has a fastcgi_cache_path that cannot be parsed")
+            found.extend(parsed)
+        # Enhance writes one vhost file per domain with at most one cache zone
+        # (none when caching is off for it); more is ambiguous, so nothing is
+        # cleared rather than guessed
+        if len(found) > 1:
             raise UnsafePath(f"{cf.name} has {len(found)} fastcgi_cache_path directives")
-        paths.append(found[0])
+        paths.extend(found)
     return paths
 
 
@@ -469,7 +478,7 @@ def clear_site_cache(uuid, logger):
         return False
     ok = True
     for cache_dir in cache_paths:
-        if cache_dir.parent != TRUSTED_CACHE_ROOT:
+        if cache_dir.parent != TRUSTED_CACHE_ROOT or cache_dir.name in ("", ".", ".."):
             logger.warning(f"[{uuid}] Not clearing {cache_dir}: not directly below "
                            f"{TRUSTED_CACHE_ROOT}")
             ok = False
