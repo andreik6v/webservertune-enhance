@@ -165,20 +165,24 @@ class FastcgiclearTests(unittest.TestCase):
     def test_mu_plugin_deployed_root_and_subdir(self):
         self.wp("public_html")
         self.wp("public_html", "blog")
-        res = fcc.deploy_mu_plugin(UUID, b"<?php // plugin\n")
+        res, note = fcc.deploy_mu_plugin(UUID, b"<?php // plugin\n")
+        self.assertIsNone(note)
+        self.assertEqual(len(res), 2)
         self.assertTrue(all(ok for _, ok, _ in res), res)
         for p in ("public_html", "public_html/blog"):
             f = self.ws / p / "wp-content/mu-plugins/fastcgiclear.php"
             self.assertEqual(f.read_bytes(), b"<?php // plugin\n")
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o644)
+            self.assertEqual(f.stat().st_uid, TENANT)
+            self.assertEqual(f.parent.stat().st_uid, TENANT)
         # idempotent
-        res = fcc.deploy_mu_plugin(UUID, b"<?php // plugin\n")
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php // plugin\n")
         self.assertTrue(all(ok for _, ok, _ in res), res)
 
     def test_mu_plugins_dir_symlink_refused(self):
         root = self.wp("public_html")
         (root / "wp-content/mu-plugins").symlink_to(self.v.dir)
-        res = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
         self.assertEqual(len(res), 1)
         self.assertFalse(res[0][1])
         self.v.assert_untouched(self)
@@ -187,7 +191,7 @@ class FastcgiclearTests(unittest.TestCase):
         root = self.wp("public_html")
         (root / "wp-content/mu-plugins").mkdir()
         (root / "wp-content/mu-plugins/fastcgiclear.php").symlink_to(self.v.file)
-        res = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
         self.assertFalse(res[0][1])
         self.v.assert_untouched(self)
 
@@ -196,7 +200,7 @@ class FastcgiclearTests(unittest.TestCase):
         root.mkdir()
         (root / "wp-config.php").write_text("<?php\n")
         (root / "wp-content").symlink_to(self.v.dir)
-        res = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
         self.assertTrue(all(not ok for _, ok, _ in res))
         self.v.assert_untouched(self)
 
@@ -207,7 +211,7 @@ class FastcgiclearTests(unittest.TestCase):
         (fake / "wp-config.php").write_text("<?php\n")
         os.chmod(fake / "wp-content", 0o700)
         (self.ws / "public_html").symlink_to(fake)
-        res = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
         self.assertEqual(res, [])
         self.assertFalse((fake / "wp-content/mu-plugins").exists())
 
@@ -215,14 +219,130 @@ class FastcgiclearTests(unittest.TestCase):
         root = self.wp("public_html")
         (root / "wp-content/mu-plugins").mkdir()
         os.link(self.v.file, root / "wp-content/mu-plugins/fastcgiclear.php")
-        res = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
         self.assertFalse(res[0][1])
         self.v.assert_untouched(self)
+
+
+    # --- ownership: never hand over something we did not create ------------
+
+    @unittest.skipUnless(AS_ROOT, "needs root to own files as another uid")
+    def test_flag_root_owned_refused(self):
+        f = self.ws / "clear.cache"
+        f.write_text("x\n")
+        os.chmod(f, 0o600)
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.ensure_flag_file(UUID)
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.write_flag_cleared(UUID)
+        st = os.lstat(f)
+        self.assertEqual((st.st_uid, stat.S_IMODE(st.st_mode), f.read_text()), (0, 0o600, "x\n"))
+
+    @unittest.skipUnless(AS_ROOT, "needs root to own files as another uid")
+    def test_flag_created_owned_by_tenant(self):
+        fcc.ensure_flag_file(UUID)
+        self.assertEqual(os.lstat(self.ws / "clear.cache").st_uid, TENANT)
+
+    @unittest.skipUnless(AS_ROOT, "needs root to own files as another uid")
+    def test_mu_dir_root_owned_refused(self):
+        root = self.wp("public_html")
+        mu = root / "wp-content/mu-plugins"
+        mu.mkdir()
+        os.chmod(mu, 0o700)       # root-owned, e.g. a directory the tenant moved into place
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertFalse(res[0][1])
+        st = os.lstat(mu)
+        self.assertEqual((st.st_uid, stat.S_IMODE(st.st_mode)), (0, 0o700))
+        self.assertEqual(os.listdir(mu), [])
+
+    @unittest.skipUnless(AS_ROOT, "needs root to own files as another uid")
+    def test_mu_file_root_owned_refused(self):
+        root = self.wp("public_html")
+        mu = root / "wp-content/mu-plugins"
+        mu.mkdir()
+        os.lchown(mu, TENANT, TENANT)
+        f = mu / "fastcgiclear.php"
+        f.write_text("root\n")
+        os.chmod(f, 0o600)
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertFalse(res[0][1])
+        self.assertEqual((os.lstat(f).st_uid, f.read_text()), (0, "root\n"))
+
+    # --- bounded search ----------------------------------------------------
+
+    def _with(self, **kw):
+        old = {k: getattr(fcc, k) for k in kw}
+        for k, v in kw.items():
+            setattr(fcc, k, v)
+        self.addCleanup(lambda: [setattr(fcc, k, v) for k, v in old.items()])
+
+    def test_walk_depth_limit(self):
+        self.wp("a", "b", "c")
+        self._with(WALK_MAX_DEPTH=2)
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertEqual(res, [])
+        self._with(WALK_MAX_DEPTH=3)
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertEqual([r[0] for r in res], ["a/b/c/wp-content/mu-plugins/fastcgiclear.php"])
+
+    def test_walk_roots_and_dirs_limits(self):
+        self.wp("s1")
+        self.wp("s2")
+        self._with(WALK_MAX_ROOTS=1)
+        res, note = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertEqual(len(res), 1)
+        self.assertIn("roots", note)
+        self._with(WALK_MAX_ROOTS=50, WALK_MAX_DIRS=2)
+        res, note = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertIn("directories", note)
+
+    def test_walk_skips_wp_content_and_files_named_like_dirs(self):
+        root = self.wp("public_html")
+        # a nested "WordPress" inside wp-content must not be treated as a root
+        (root / "wp-content/plugins/x/wp-content").mkdir(parents=True)
+        (root / "wp-content/plugins/x/wp-config.php").write_text("")
+        # wp-content as a regular file is not a root either
+        (self.ws / "other").mkdir()
+        (self.ws / "other/wp-config.php").write_text("")
+        (self.ws / "other/wp-content").write_text("")
+        give_to_tenant(self.ws)
+        res, _ = fcc.deploy_mu_plugin(UUID, b"<?php\n")
+        self.assertEqual([r[0] for r in res], ["public_html/wp-content/mu-plugins/fastcgiclear.php"])
+
+    # --- cache directories -------------------------------------------------
+
+    def test_cache_dir_trust(self):
+        croot = self.tmp / "nginx_cache"
+        croot.mkdir()
+        os.chmod(croot, 0o755)
+        self._with(TRUSTED_CACHE_ROOT=croot)
+        (croot / "example.com").mkdir()
+        (croot / "link.com").symlink_to(self.v.dir)
+        (croot / "deep").mkdir()
+        (croot / "deep" / "x").mkdir()
+        self.assertTrue(fcc.cache_dir_is_trusted(croot / "example.com"))
+        self.assertFalse(fcc.cache_dir_is_trusted(croot / "link.com"))
+        self.assertFalse(fcc.cache_dir_is_trusted(croot / "deep" / "x"))
+        self.assertFalse(fcc.cache_dir_is_trusted(croot / "missing"))
+        self.assertFalse(fcc.cache_dir_is_trusted(self.v.dir))
+        self.assertFalse(fcc.cache_dir_is_trusted(croot / ".." / "outside"))
+        self.assertFalse(fcc.cache_dir_is_trusted(croot))
+        os.chmod(croot, 0o777)
+        self.assertFalse(fcc.cache_dir_is_trusted(croot / "example.com"))
+        os.chmod(croot, 0o755)
+
+
+def ngx_env(tmp):
+    """Point nginxtune at a temp tree; the worker user is nobody (exists everywhere)."""
+    (tmp / "nginx.conf").write_text("user nobody;\nworker_processes auto;\n")
+    ngx.NGINX_CONF = tmp / "nginx.conf"
+    ngx._acl_done.clear()
 
 
 class NginxtuneLogTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        ngx_env(self.tmp)
         ngx.SITE_LOGS_DIR = self.tmp / "sites"
         self.v = Victims(self.tmp)
 
@@ -237,8 +357,34 @@ class NginxtuneLogTests(unittest.TestCase):
         self.assertFalse(ngx._ensure_site_log_dir(UUID, LOG))
         self.v.assert_untouched(self)
 
+    @unittest.skipUnless(AS_ROOT, "ownership and ACLs need root")
+    def test_site_log_dir_owner_mode_acl(self):
+        self.assertTrue(ngx._ensure_site_log_dir(UUID, LOG))
+        import subprocess
+        for d in (ngx.SITE_LOGS_DIR, ngx.SITE_LOGS_DIR / UUID):
+            st = os.lstat(d)
+            self.assertEqual((st.st_uid, stat.S_IMODE(st.st_mode)), (0, 0o750))
+            acl = subprocess.run(["getfacl", "-cp", str(d)], capture_output=True, text=True).stdout
+            self.assertIn("user:nobody:--x", acl)
+
+    def test_site_log_dir_unsafe_parent_refused(self):
+        os.chmod(self.tmp, 0o777)
+        try:
+            self.assertFalse(ngx._ensure_site_log_dir(UUID, LOG))
+            self.assertFalse(ngx.SITE_LOGS_DIR.exists())
+        finally:
+            os.chmod(self.tmp, 0o700)
+
+    def test_site_log_dir_foreign_owner_refused(self):
+        if not AS_ROOT:
+            self.skipTest("needs root")
+        ngx.SITE_LOGS_DIR.mkdir()
+        os.chown(ngx.SITE_LOGS_DIR, TENANT, TENANT)
+        self.assertFalse(ngx._ensure_site_log_dir(UUID, LOG))
+        self.assertEqual(os.lstat(ngx.SITE_LOGS_DIR).st_uid, TENANT)
+
     def test_site_log_dir_bad_uuid_refused(self):
-        for name in ("../../etc", "abc", "", UUID + "/x"):
+        for name in ("../../etc", "abc", "", UUID + "/x", UUID + "\n"):
             self.assertFalse(ngx._ensure_site_log_dir(name, LOG))
         self.assertFalse((self.tmp / "etc").exists())
 
@@ -247,6 +393,7 @@ class NginxtuneLogTests(unittest.TestCase):
         ws.mkdir()
         (ws / "php-error.log").symlink_to(self.v.file)
         fw = ngx.FileWatcher(str(ws / "php-error.log"), LOG, seek_to_end_on_open=False)
+        self.assertIsNone(fw.fh, "opened a symlink")
         self.assertEqual(fw.readlines(), [])
         fw.close()
         os.unlink(ws / "php-error.log")
@@ -258,6 +405,15 @@ class NginxtuneLogTests(unittest.TestCase):
         t.join(3)
         self.assertFalse(t.is_alive(), "FileWatcher blocked on a FIFO")
         self.assertEqual(out.get("lines"), [])
+
+    def test_filewatcher_refuses_hardlink(self):
+        ws = self.tmp / "ws"
+        ws.mkdir()
+        os.link(self.v.file, ws / "php-error.log")
+        fw = ngx.FileWatcher(str(ws / "php-error.log"), LOG, seek_to_end_on_open=False)
+        self.assertIsNone(fw.fh, "opened a hard link")
+        self.assertEqual(fw.readlines(), [])
+        fw.close()
 
     def test_filewatcher_reads_regular_file(self):
         f = self.tmp / "real.log"
@@ -286,11 +442,26 @@ include vhost_includes/example.com.conf;
 class NginxtuneMigrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        ngx_env(self.tmp)
         ngx.SITES_DIR = self.tmp / "sites-enabled"
         ngx.SITES_DIR.mkdir()
         ngx.SITE_LOGS_DIR = self.tmp / "logs"
         self.conf = ngx.SITES_DIR / "example.com.conf"
         self.conf.write_text(VHOST)
+
+    def settle(self, cfg):
+        """Apply until stable; must converge on the second pass with no change."""
+        ngx.apply_logging_features(cfg, LOG)
+        before = self.conf.read_text()
+        self.assertFalse(ngx.apply_logging_features(cfg, LOG), "second pass changed the file")
+        self.assertEqual(self.conf.read_text(), before)
+        return before
+
+    def assert_consistent(self, text):
+        fmt = text.count("_persistent '")
+        log = text.count("_persistent;")
+        self.assertEqual(fmt, log, "persistent format and access_log out of step")
+        self.assertLessEqual(fmt, 1)
 
     def cfg(self, pers, conn=False):
         return {"general": {"persistent_logging": pers},
@@ -302,6 +473,8 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertNotIn("access_log /var/www/", text)
         self.assertIn(f"access_log {ngx.SITE_LOGS_DIR}/{UUID}/webserver.log example.com_persistent;", text)
         self.assertEqual(text.count("_persistent;"), 1)
+        # the legacy line is removed as a whole line, not left behind as blank space
+        self.assertEqual([l for l in text.splitlines() if not l.strip()], [])
         self.assertTrue((ngx.SITE_LOGS_DIR / UUID).is_dir())
         # idempotent
         self.assertFalse(ngx.apply_logging_features(self.cfg(True), LOG))
@@ -321,6 +494,53 @@ class NginxtuneMigrationTests(unittest.TestCase):
         # turning everything off removes the persistent log entirely
         self.assertTrue(ngx.apply_logging_features(self.cfg(False), LOG))
         self.assertNotIn("/webserver.log", self.conf.read_text())
+
+    def test_odd_legacy_forms_stripped(self):
+        odd = VHOST.replace(
+            f"access_log /var/www/{UUID}/logs/webserver.log example.com_persistent;",
+            f'access_log\t"/var/www/{UUID}/logs/webserver.log"\n        example.com_persistent;\n'
+            f"  access_log '/var/www/{UUID}/other.log' example.com;\n"
+            f"location /x {{ access_log /var/www/{UUID}/x.log; return 204; }}")
+        self.conf.write_text(odd)
+        for pers in (True, False):
+            text = self.settle(self.cfg(pers))
+            self.assertNotRegex(text, r"access_log\s+[\"']?/var/www")
+            self.assertIn("location /x {  return 204; }", text)
+            self.assert_consistent(text)
+
+    def test_vhost_without_uuid_converges_without_orphans(self):
+        no_uuid = VHOST.replace(
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log example.com;\n", "")
+        self.conf.write_text(no_uuid)
+        text = self.settle(self.cfg(True))
+        self.assertNotIn("_persistent", text)
+        self.assertNotIn("/var/www/" + UUID + "/logs", text)
+
+    def test_orphan_format_removed(self):
+        orphan = VHOST.replace(
+            f"access_log /var/www/{UUID}/logs/webserver.log example.com_persistent;\n", "")
+        self.conf.write_text(orphan)
+        text = self.settle(self.cfg(False))
+        self.assertNotIn("_persistent", text)
+
+    def test_log_dir_failure_means_no_persistent_lines(self):
+        ngx.SITE_LOGS_DIR.mkdir()
+        (ngx.SITE_LOGS_DIR / UUID).symlink_to(self.tmp)
+        text = self.settle(self.cfg(True))
+        self.assertNotIn("_persistent", text)
+        self.assertNotIn("/var/www/" + UUID + "/logs", text)
+
+    def test_dotted_format_name_used_for_both_lines(self):
+        text = self.settle(self.cfg(True))
+        self.assertIn("log_format example.com_persistent '", text)
+        self.assertIn("webserver.log example.com_persistent;", text)
+        self.assert_consistent(text)
+
+    def test_unchanged_file_not_rewritten(self):
+        self.settle(self.cfg(True))
+        m1 = os.stat(self.conf).st_mtime_ns
+        self.assertFalse(ngx.apply_logging_features(self.cfg(True), LOG))
+        self.assertEqual(os.stat(self.conf).st_mtime_ns, m1)
 
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code

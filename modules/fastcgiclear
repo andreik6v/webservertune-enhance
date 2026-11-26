@@ -46,14 +46,27 @@ _CACHE_PATH_RE = re.compile(r'fastcgi_cache_path\s+(\S+)')
 #     so the tenant cannot replace that entry itself;
 #   - opens each further path component relative to the previous fd with
 #     O_NOFOLLOW, so a symlinked component fails with ELOOP/ENOTDIR;
-#   - checks the opened file with fstat (regular file, single hard link,
-#     owned by root or the tenant) before writing, and changes ownership and
-#     mode only through the fd (fchown/fchmod).
+#   - checks the opened file with fstat (regular file, single hard link)
+#     before writing, and changes ownership and mode only through the fd
+#     (fchown/fchmod);
+#   - gives ownership to the site user only for files/dirs it has just
+#     created itself. An existing entry must already belong to the site user:
+#     a root- or other-owned entry the tenant moved into place is refused,
+#     never re-owned.
 # A tenant who swaps components mid-operation can only make it fail.
 
 _DIR_FLAGS  = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 _FILE_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
 _FLAG_MAX   = 64
+
+# Bounds for the WordPress search, so one tenant cannot stall the service
+# with a huge or very deep tree.
+WALK_MAX_DEPTH = 6
+WALK_MAX_DIRS  = 20000
+WALK_MAX_ROOTS = 50
+
+# FastCGI cache directories are only ever deleted below this root-owned path.
+TRUSTED_CACHE_ROOT = Path("/var/nginx_cache")
 
 
 class UnsafePath(Exception):
@@ -135,15 +148,23 @@ def read_small(dir_fd, name, limit=_FLAG_MAX):
 def write_owned(dir_fd, name, data, uid, gid, mode=0o644):
     """Create or replace the content of a regular file in dir_fd and give it to uid:gid.
 
-    Never follows a symlink, never writes to a FIFO/device or a multiply-linked file,
-    and only touches files already owned by root or by uid.
+    Never follows a symlink, never writes to a FIFO/device or a multiply-linked file.
+    A new file is created exclusively (so it is ours); an existing file is only
+    rewritten if it already belongs to uid. Root- or other-owned files are refused.
     """
     try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | _FILE_FLAGS, mode, dir_fd=dir_fd)
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS, mode, dir_fd=dir_fd)
+        created = True
+    except FileExistsError:
+        try:
+            fd = os.open(name, os.O_WRONLY | _FILE_FLAGS, dir_fd=dir_fd)
+        except OSError as e:
+            raise UnsafePath(f"{name}: {e}") from e
+        created = False
     except OSError as e:
         raise UnsafePath(f"{name}: {e}") from e
     try:
-        _check_regular(fd, name, {0, uid})
+        _check_regular(fd, name, {os.geteuid()} if created else {uid})
         os.ftruncate(fd, 0)
         view = memoryview(data)
         while view:
@@ -171,13 +192,17 @@ def ensure_flag_file(uuid):
         if read_small(ws, FLAG_FILE) is None:
             write_owned(ws, FLAG_FILE, b"cache=cleared\n", uid, gid)
             return True
-        # exists: only fix ownership/mode, through a checked fd
-        fd = os.open(FLAG_FILE, os.O_RDONLY | _FILE_FLAGS, dir_fd=ws)
+        # exists: it must already be the site user's file; only fix group/mode,
+        # through a checked fd. A root- or other-owned file is never handed over.
         try:
-            st = _check_regular(fd, FLAG_FILE, {0, uid})
-            if st.st_uid != uid or st.st_gid != gid:
+            fd = os.open(FLAG_FILE, os.O_RDONLY | _FILE_FLAGS, dir_fd=ws)
+        except OSError as e:
+            raise UnsafePath(f"{FLAG_FILE}: {e}") from e
+        try:
+            st = _check_regular(fd, FLAG_FILE, {uid})
+            if st.st_gid != gid:
                 os.fchown(fd, uid, gid)
-            if (st.st_mode & 0o777) != 0o644:
+            if (st.st_mode & 0o7777) != 0o644:
                 os.fchmod(fd, 0o644)
         finally:
             os.close(fd)
@@ -208,27 +233,66 @@ def write_flag_cleared(uuid):
         os.close(ws)
 
 
-def find_wp_roots(uuid):
-    """Relative path parts of every WordPress root in the webspace.
+def find_wp_roots(ws_fd):
+    """Relative path parts of every WordPress root below the webspace fd.
 
-    Walks without following symlinked directories and does not descend into
-    wp-content. A tenant can still make this list wrong, but every write
-    afterwards re-opens the components with O_NOFOLLOW.
+    Iterative and fd-based: every directory is opened relative to the webspace
+    with O_NOFOLLOW (re-walked from ws_fd, so no fds pile up), symlinked
+    directories are never entered, wp-content is not descended into, and the
+    search is bounded by WALK_MAX_DEPTH / WALK_MAX_DIRS / WALK_MAX_ROOTS.
+    Directories that vanish or cannot be read are skipped.
+
+    Returns (roots, note) where note explains an early stop, or None.
     """
-    base  = str(WWW_DIR / uuid)
-    roots = []
-    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
-        dirnames[:] = [d for d in dirnames if d != "wp-content"]
-        if "wp-config.php" in filenames and "wp-content" in os.listdir(dirpath):
-            rel = os.path.relpath(dirpath, base)
-            roots.append([] if rel == "." else rel.split(os.sep))
-    return roots
+    roots, note = [], None
+    stack, visited = [[]], 0
+    while stack:
+        parts = stack.pop()
+        visited += 1
+        if visited > WALK_MAX_DIRS:
+            note = f"stopped after {WALK_MAX_DIRS} directories"
+            break
+        try:
+            fd = open_subdir(ws_fd, parts)
+        except UnsafePath:
+            continue
+        try:
+            with os.scandir(fd) as it:
+                entries = list(it)
+        except OSError:
+            entries = []
+        finally:
+            os.close(fd)
+        dirs, files = set(), set()
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    dirs.add(e.name)
+                elif e.is_file(follow_symlinks=False):
+                    files.add(e.name)
+            except OSError:
+                continue
+        if "wp-config.php" in files and "wp-content" in dirs:
+            roots.append(parts)
+            if len(roots) >= WALK_MAX_ROOTS:
+                note = f"stopped after {WALK_MAX_ROOTS} WordPress roots"
+                break
+        if len(parts) < WALK_MAX_DEPTH:
+            for name in sorted(dirs - {"wp-content"}, reverse=True):
+                stack.append(parts + [name])
+    return roots, note
+
+
+def _label(parts):
+    """Printable relative path for log messages (tenant file names may not be valid UTF-8)."""
+    return "/".join(parts).encode("utf-8", "backslashreplace").decode("ascii", "backslashreplace")
 
 
 def deploy_mu_plugin(uuid, plugin_bytes):
     """Install plugin_bytes as wp-content/mu-plugins/fastcgiclear.php in every WordPress root.
 
-    Returns a list of (relative_path, ok, message).
+    Returns (results, note): a list of (relative_path, ok, message) and the
+    note from find_wp_roots (None unless the search stopped early).
     """
     results = []
     ws = open_webspace(uuid)
@@ -236,8 +300,9 @@ def deploy_mu_plugin(uuid, plugin_bytes):
         uid, gid = webspace_owner(ws)
         if uid == 0:
             raise UnsafePath(f"webspace {uuid} is owned by root")
-        for parts in find_wp_roots(uuid):
-            label = "/".join(parts + ["wp-content", "mu-plugins", MU_PLUGIN_NAME])
+        roots, note = find_wp_roots(ws)
+        for parts in roots:
+            label = _label(parts + ["wp-content", "mu-plugins", MU_PLUGIN_NAME])
             try:
                 wpc = open_subdir(ws, parts + ["wp-content"])
                 try:
@@ -250,9 +315,10 @@ def deploy_mu_plugin(uuid, plugin_bytes):
                     mu = open_subdir(wpc, ["mu-plugins"])
                     try:
                         st = os.fstat(mu)
-                        # take ownership only of a directory we created or one root left
-                        # behind; never re-own a directory belonging to someone else
-                        if created or st.st_uid == 0:
+                        # Hand over only the directory we just created: still ours and
+                        # still empty (so it was not swapped for another directory in
+                        # between). An existing directory must already be the site user's.
+                        if created and st.st_uid == os.geteuid() and not os.listdir(mu):
                             os.fchown(mu, uid, gid)
                             os.fchmod(mu, 0o755)
                         elif st.st_uid != uid:
@@ -267,7 +333,23 @@ def deploy_mu_plugin(uuid, plugin_bytes):
                 results.append((label, False, str(e)))
     finally:
         os.close(ws)
-    return results
+    return results, note
+
+
+def cache_dir_is_trusted(path):
+    """True if path is a real directory directly below TRUSTED_CACHE_ROOT, which is
+    root-owned and not writable by group/other. Only such directories are emptied."""
+    try:
+        p = Path(path)
+        if p.parent != TRUSTED_CACHE_ROOT or p.name in ("", ".", ".."):
+            return False
+        root_st = os.lstat(TRUSTED_CACHE_ROOT)
+        if (not stat.S_ISDIR(root_st.st_mode) or root_st.st_uid not in (0, os.geteuid())
+                or root_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            return False
+        return stat.S_ISDIR(os.lstat(p).st_mode)
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -318,13 +400,15 @@ def watch(config, logger):
             logger.warning(f"mu-plugin source not found: {MU_PLUGIN_SRC}")
             return
         try:
-            results = deploy_mu_plugin(uuid, plugin_bytes)
+            results, note = deploy_mu_plugin(uuid, plugin_bytes)
         except UnsafePath as e:
             logger.warning(f"[{uuid}] Refusing to deploy mu-plugin: {e}")
             return
         except Exception as e:
             logger.error(f"[{uuid}] Failed to deploy mu-plugin: {e}")
             return
+        if note:
+            logger.warning(f"[{uuid}] WordPress search {note}; some installs may be missed")
         for label, ok, msg in results:
             if ok:
                 logger.info(f"[{uuid}] Deployed mu-plugin to {label}")
@@ -392,15 +476,19 @@ def watch(config, logger):
             return
 
         for cache_dir in cache_paths:
-            if not cache_dir.is_dir():
+            if not cache_dir_is_trusted(cache_dir):
+                logger.warning(f"[{uuid}] Not clearing {cache_dir}: not a real directory "
+                               f"directly below {TRUSTED_CACHE_ROOT}")
                 continue
             try:
-                for entry in cache_dir.iterdir():
+                with os.scandir(cache_dir) as it:
+                    entries = list(it)
+                for entry in entries:
                     try:
-                        if entry.is_dir():
-                            shutil.rmtree(entry)
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(entry.path)
                         else:
-                            entry.unlink()
+                            os.unlink(entry.path)
                     except Exception:
                         pass
                 logger.info(f"[{uuid}] Cleared cache dir {cache_dir}")
@@ -452,7 +540,8 @@ def watch(config, logger):
 
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, errors="replace"
                 )
                 watcher_proc[0] = proc
             except Exception as e:
@@ -532,7 +621,8 @@ def watch(config, logger):
         while True:
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, errors="replace"
                 )
             except FileNotFoundError:
                 logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
