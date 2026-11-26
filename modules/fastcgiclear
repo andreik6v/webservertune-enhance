@@ -10,6 +10,7 @@ Called by webservertune-enhance main program.
 import collections
 import errno
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -30,7 +31,7 @@ UUID_RE = re.compile(
     re.IGNORECASE
 )
 
-_CACHE_PATH_RE = re.compile(r'fastcgi_cache_path\s+(\S+)')
+_CACHE_PATH_RE = re.compile(r'''fastcgi_cache_path\s+(?:"([^"]+)"|'([^']+)'|([^\s"';]+))''')
 
 
 # ---------------------------------------------------------------------------
@@ -297,26 +298,42 @@ def find_wp_roots(ws_fd):
     return roots, note
 
 
-def _mkdir_as(path, uid, gid, mode=0o755):
-    """Create a directory with the site user's own credentials.
+_MKDIR_CHILD = (
+    "import os, sys\n"
+    "try:\n"
+    "    os.mkdir(sys.argv[2], 0o755, dir_fd=int(sys.argv[1]))\n"
+    "except FileExistsError:\n"
+    "    pass\n"
+)
 
-    The path is resolved as the site user, so anything they planted in it
-    can only lead to places they can already write. Root never creates and
-    then re-owns a directory, so there is nothing to swap.
+
+def _mkdir_as(dir_fd, name, uid):
+    """Create directory `name` inside the open directory dir_fd as the site user.
+
+    A child process with the site account's uid and primary gid (from the
+    passwd entry, never from the tenant-controlled directory) and no
+    supplementary groups calls mkdirat() on the inherited descriptor, so no
+    path is resolved again. Root never creates and then re-owns a directory,
+    so there is nothing to swap.
     """
+    if "/" in name or name in ("", ".", ".."):
+        raise UnsafePath(f"bad directory name: {name!r}")
     if os.geteuid() == 0:
+        try:
+            gid = pwd.getpwuid(uid).pw_gid
+        except KeyError:
+            raise UnsafePath(f"uid {uid} has no passwd entry")
         creds = {"user": uid, "group": gid, "extra_groups": []}
     elif os.geteuid() == uid:
         creds = {}
     else:
         raise UnsafePath("cannot act as the site user")
-    r = subprocess.run(["mkdir", "-m", format(mode, "o"), "--", os.fsdecode(path)],
-                       capture_output=True, timeout=30,
-                       env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, **creds)
+    r = subprocess.run([sys.executable, "-I", "-S", "-c", _MKDIR_CHILD, str(dir_fd), name],
+                       pass_fds=(dir_fd,), cwd="/", env={"LC_ALL": "C"},
+                       capture_output=True, timeout=30, **creds)
     if r.returncode != 0:
-        msg = r.stderr.decode("utf-8", "replace").strip()
-        if "File exists" not in msg:
-            raise UnsafePath(f"mkdir as site user failed: {msg}")
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise UnsafePath(f"mkdir as site user failed: {err[-1] if err else r.returncode}")
 
 
 def _label(parts):
@@ -345,8 +362,7 @@ def deploy_mu_plugin(uuid, plugin_bytes):
                     try:
                         os.lstat("mu-plugins", dir_fd=wpc)
                     except FileNotFoundError:
-                        _mkdir_as(WWW_DIR.joinpath(uuid, *parts, "wp-content", "mu-plugins"),
-                                  uid, gid)
+                        _mkdir_as(wpc, "mu-plugins", uid)
                     mu = open_subdir(wpc, ["mu-plugins"])
                     try:
                         # the directory must be the site user's own; it is never re-owned
@@ -378,10 +394,16 @@ def find_cache_paths(uuid):
         content = cf.read_text()
         if not log_re.search(content):
             continue
+        found = []
         for line in content.splitlines():
             m = _CACHE_PATH_RE.match(line.strip())
             if m:
-                paths.append(Path(m.group(1)))
+                found.append(Path(next(g for g in m.groups() if g)))
+        # Enhance writes one vhost file per domain with exactly one cache zone;
+        # anything else is ambiguous, and nothing is cleared rather than guessed
+        if len(found) != 1:
+            raise UnsafePath(f"{cf.name} has {len(found)} fastcgi_cache_path directives")
+        paths.append(found[0])
     return paths
 
 
@@ -532,11 +554,12 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _find_cache_paths(uuid):
+        """List of cache dirs, or None when they cannot be determined safely."""
         try:
             return find_cache_paths(uuid)
         except Exception as e:
-            logger.error(f"[{uuid}] Failed to find cache paths: {e}")
-            return []
+            logger.error(f"[{uuid}] Cannot determine cache paths: {e}")
+            return None
 
     def _do_clear(uuid):
         """
@@ -546,14 +569,28 @@ def watch(config, logger):
         logger.info(f"[{uuid}] Clearing FastCGI cache")
 
         cache_paths = _find_cache_paths(uuid)
+        if cache_paths is None:
+            logger.error(f"[{uuid}] Leaving {FLAG_FILE} as cache=stale")
+            return
         if not cache_paths:
             logger.debug(f"[{uuid}] No cache paths found, skipping")
             return
 
         failed = False
         for cache_dir in cache_paths:
-            if not os.path.lexists(cache_dir):
+            if cache_dir.parent != TRUSTED_CACHE_ROOT:
+                logger.warning(f"[{uuid}] Not clearing {cache_dir}: not directly below "
+                               f"{TRUSTED_CACHE_ROOT}")
+                failed = True
+                continue
+            try:
+                os.lstat(cache_dir)
+            except FileNotFoundError:
                 continue            # nothing cached yet
+            except OSError as e:
+                logger.error(f"[{uuid}] Cannot check {cache_dir}: {e}")
+                failed = True
+                continue
             if not cache_dir_is_trusted(cache_dir):
                 logger.warning(f"[{uuid}] Not clearing {cache_dir}: not a real directory "
                                f"directly below {TRUSTED_CACHE_ROOT}")

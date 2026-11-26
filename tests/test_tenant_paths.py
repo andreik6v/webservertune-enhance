@@ -355,9 +355,35 @@ class FastcgiclearTests(unittest.TestCase):
     def test_mkdir_as_other_user_refused_unprivileged(self):
         if AS_ROOT:
             self.skipTest("unprivileged only")
-        with self.assertRaises(fcc.UnsafePath):
-            fcc._mkdir_as(self.ws / "x", os.geteuid() + 1, os.getegid())
+        fd = os.open(self.ws, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(fcc.UnsafePath):
+                fcc._mkdir_as(fd, "x", os.geteuid() + 1)
+            with self.assertRaises(fcc.UnsafePath):
+                fcc._mkdir_as(fd, "../x", os.geteuid())
+        finally:
+            os.close(fd)
         self.assertFalse((self.ws / "x").exists())
+
+    def test_mkdir_as_creates_inside_fd_as_site_user(self):
+        import pwd
+        sub = self.ws / "sub"
+        sub.mkdir()
+        give_to_tenant(self.ws)
+        fd = os.open(sub, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            # the fd stays bound to the original directory even if the path is swapped
+            os.rename(sub, self.ws / "moved")
+            (self.ws / "sub").symlink_to(self.v.dir)
+            fcc._mkdir_as(fd, "made", TENANT)
+            fcc._mkdir_as(fd, "made", TENANT)          # exists: fine
+        finally:
+            os.close(fd)
+        st = os.lstat(self.ws / "moved" / "made")
+        self.assertEqual(st.st_uid, TENANT)
+        if AS_ROOT:
+            self.assertEqual(st.st_gid, pwd.getpwuid(TENANT).pw_gid)
+        self.v.assert_untouched(self)
 
     def test_find_cache_paths_matches_enhance_log_only(self):
         sites = self.tmp / "sites-enabled"
@@ -375,6 +401,16 @@ class FastcgiclearTests(unittest.TestCase):
             "fastcgi_cache_path /c/b levels=1:2 keys_zone=b:10m;\n"
             f"access_log /var/local/enhance/webserver_logs/{other}.log b;\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/ap"])
+        (sites / "a-preview.conf").write_text(
+            "fastcgi_cache_path \"/c/a p\" levels=1:2 keys_zone=ap:10m;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log ap;\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        (sites / "two.conf").write_text(
+            "fastcgi_cache_path /c/x levels=1:2 keys_zone=x:10m;\n"
+            "fastcgi_cache_path /c/y levels=1:2 keys_zone=y:10m;\n"
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log x;\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
 
     def test_clear_cache_dir_empties_without_following_links(self):
         c = self.tmp / "cache"
@@ -688,6 +724,36 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertEqual(text.count("log_format example.com_persistent"), 1)
         self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
         self.assertNotIn("old_persistent", text)
+
+    def test_multiline_quoted_string_file_left_untouched(self):
+        ml = VHOST.replace("listen 80;", 'listen 80;\nadd_header X-Note "line one;\nline two";')
+        self.conf.write_text(ml)
+        for pers in (True, False):
+            self.assertFalse(ngx.apply_logging_features(self.cfg(pers), LOG))
+            self.assertEqual(self.conf.read_text(), ml)
+
+    def test_log_format_with_trailing_comment_supported(self):
+        c = VHOST.replace('\\"$msec\\"";', '\\"$msec\\""; # main format')
+        self.assertIn("# main format", c)
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(True))
+        self.assertEqual(text.count(f"{UUID}/webserver.log example.com_persistent;"), 1)
+        self.assertIn("# main format", text)
+
+    def test_access_log_text_inside_quotes_not_stripped(self):
+        q = VHOST.replace("listen 80;", f'listen 80;\nadd_header X-Doc "see access_log /var/www/{UUID}/x.log; docs";')
+        self.conf.write_text(q)
+        text = self.settle(self.cfg(False))
+        self.assertIn(f'add_header X-Doc "see access_log /var/www/{UUID}/x.log; docs";', text)
+        self.assertNotRegex(text, r"(?m)^\s*access_log\s+[\"']?/var/www")
+
+    def test_existing_log_file_must_be_regular(self):
+        d = ngx.SITE_LOGS_DIR / UUID
+        d.mkdir(parents=True)
+        (d / "webserver.log").symlink_to(self.tmp / "elsewhere.log")
+        text = self.settle(self.cfg(True))
+        self.assertNotIn("_persistent", text)
+        self.assertFalse((self.tmp / "elsewhere.log").exists())
 
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code

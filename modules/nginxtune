@@ -42,7 +42,7 @@ DEFAULT_WORKER_USER = "www-data"
 # Comments are matched first and kept as they are, so a commented-out line without
 # a ';' can never make the match run into the following directives.
 _WEBSPACE_LOG_RE = re.compile(
-    r'(#[^\n]*)'
+    r'(#[^\n]*|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\')'
     r'|^[ \t]*access_log\s+["\']?/var/www/[^;#]*;[ \t]*(?:\r?\n)?'
     r'|(?<![\w$])access_log\s+["\']?/var/www/[^;#]*;',
     re.MULTILINE)
@@ -54,6 +54,25 @@ def _site_log_path(uuid, name):
 
 def _is_current_pers_log_line(s):
     return s.startswith(f"access_log {SITE_LOGS_DIR}/") and "/webserver.log " in s
+
+
+def _code_part(line):
+    """(balanced, code): the line without a trailing comment, and whether every
+    quote opened on it is closed on it (backslash escapes honoured)."""
+    q, esc = None, False
+    for i, ch in enumerate(line):
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif q:
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#":
+            return True, line[:i]
+    return q is None, line
 
 
 def _enhance_log_uuid(s):
@@ -949,6 +968,14 @@ def apply_logging_features(config, logger):
             logger.error(f"Failed to read {filename}: {e}")
             continue
 
+        # quoted strings spanning lines cannot be handled by this line-based
+        # editor: leave such a file exactly as it is (the deploy checks look for
+        # webspace log paths in every nginx file independently)
+        if not all(_code_part(l)[0] for l in original.splitlines()):
+            logger.warning(f"logging_features: {filename} has a quoted string spanning lines, "
+                           "not changing it")
+            continue
+
         text, n_legacy = _strip_webspace_logs(original)
         has_legacy_log = n_legacy > 0
         lines          = text.splitlines(keepends=True)
@@ -966,7 +993,7 @@ def apply_logging_features(config, logger):
             s = line.strip()
             if s.startswith("#"):
                 continue
-            if s.startswith("log_format") and not s.endswith(";"):
+            if s.startswith("log_format") and not _code_part(s)[1].rstrip().endswith(";"):
                 fmts_single = False
             if _is_current_pers_log_line(s):
                 pers_logs.append(s)
@@ -1203,6 +1230,17 @@ def _ensure_site_log_dir(uuid, logger):
             if st.st_uid not in (0, euid):
                 logger.error(f"{d} is owned by uid {st.st_uid}, refusing to use it")
                 return False
+            if d != SITE_LOGS_DIR:
+                # files nginx (as root) or this service will open must be real files
+                for name in ("webserver.log", "php.log"):
+                    try:
+                        fst = os.lstat(d / name)
+                    except FileNotFoundError:
+                        continue
+                    if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                        logger.error(f"{d / name} is not a regular single-link file, "
+                                     "refusing to use it")
+                        return False
             if is_root:
                 if st.st_uid != 0 or st.st_gid != gid:
                     os.chown(d, 0, gid, follow_symlinks=False)
