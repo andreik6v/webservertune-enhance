@@ -245,6 +245,15 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - The CMS overrides can cause issues with the Enhance file manager when applied on the control panel, or block certain functionalities of your CMS.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
+## Fork notes (andreik6v)
+
+This fork is upstream [rdbf/webservertune-enhance](https://github.com/rdbf/webservertune-enhance) plus:
+
+- `connection_ip_logging` for Nginx persistent logs (upstream PR #4)
+- `cms_protection` fix: deny-only rules, so PHP source is no longer served for allowlisted plugins
+
+Install from this fork with `git clone https://github.com/andreik6v/webservertune-enhance.git /opt/webservertune-enhance`. Upstream changes are merged into `main` here.
+
 ## Version History
 
 **0.7.2** — Fix for enhanceapi module to build org cache from 2 different sources, including reseller accounts.
