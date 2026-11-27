@@ -470,10 +470,14 @@ def find_cache_paths(uuid):
         raise UnsafePath("no vhost names this webspace")
     # a vhost file on disk that names the webspace but is not part of the loaded
     # graph (e.g. an include edited but not reloaded yet) may still be served
-    # (its includes are followed too)
-    matched_real = {os.path.realpath(f) for f in matched}
+    # (its includes are followed too). Files nginx already loads as vhosts were
+    # checked above; dotfiles (editor swap/lock files, .git) and directories are
+    # never loaded by `include sites-enabled/*` and are skipped like glob(3) does.
+    loaded = {os.path.realpath(g.file) for g in files if g.base == ("http",) and is_vhost_file(g.file)}
     for cf in sorted(SITES_DIR.iterdir()):
-        if os.path.realpath(cf) in matched_real or not is_vhost_file(str(cf)):
+        if cf.name.startswith(".") or os.path.realpath(cf) in loaded or not is_vhost_file(str(cf)):
+            continue
+        if cf.is_dir():
             continue
         pending, perrors = nc.include_graph(str(cf), conf_base=str(NGINX_CONF_DIR))
         if perrors:

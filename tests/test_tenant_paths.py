@@ -599,6 +599,19 @@ class FastcgiclearTests(unittest.TestCase):
             fcc.find_cache_paths(UUID)
         os.unlink(sites / "b-pending.conf")
         (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        # editor files, .git and sub-directories in sites-enabled do not block
+        (sites / ".git").mkdir()
+        (sites / ".#a.conf").symlink_to(self.tmp / "nowhere")
+        (sites / ".a.conf.swp").write_bytes(
+            b"\x00\x01 access_log /var/local/enhance/webserver_logs/" + UUID.encode() + b".log x; {")
+        (sites / "disabled").mkdir()
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {sites}/*.conf; }}\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        for n in (".#a.conf", ".a.conf.swp"):
+            os.unlink(sites / n)
+        os.rmdir(sites / ".git")
+        os.rmdir(sites / "disabled")
         # sites-enabled entries may be symlinks into sites-available
         avail = self.tmp / "sites-available"
         avail.mkdir()
