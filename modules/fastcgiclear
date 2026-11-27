@@ -442,7 +442,9 @@ def find_cache_paths(uuid):
     vhost_dir = os.path.realpath(SITES_DIR)
 
     def is_vhost_file(f):
-        return (os.path.dirname(os.path.realpath(f)) == vhost_dir
+        # by the directory it is listed in, not its target (sites-enabled
+        # entries may be symlinks into sites-available)
+        return (os.path.realpath(os.path.dirname(os.path.abspath(f))) == vhost_dir
                 and not os.path.basename(f).startswith("000-"))
 
     def names_log(d):

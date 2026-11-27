@@ -165,8 +165,15 @@ def _reaches_www(path):
     any point: a component, any symlink hop (even one that later leads back
     out), or the final target. The nginx master opens log files as root, so a
     webspace anywhere on the way lets the site user redirect the open."""
+    return _walk(path)[0]
+
+
+def _walk(path):
+    """(reaches_www, resolved): resolve path hop by hop like the kernel; the
+    part that does not exist is kept literally. resolved always starts with a
+    single '/'."""
     if _in_www(os.path.normpath(path)):
-        return True
+        return True, os.path.normpath(path)
     parts, cur, hops = [p for p in path.split("/") if p], "/", 0
     while parts:
         comp = parts.pop(0)
@@ -175,34 +182,34 @@ def _reaches_www(path):
         if comp == "..":
             cur = os.path.dirname(cur) or "/"
             if _in_www(cur):
-                return True
+                return True, cur
             continue
         nxt = os.path.join(cur, comp)
         if _in_www(nxt):
-            return True
+            return True, nxt
         try:
             st = os.lstat(nxt)
         except FileNotFoundError:
             cur = nxt                      # does not exist (yet): the rest is literal
             continue
         except OSError:
-            return True                    # cannot inspect: refuse
+            return True, cur               # cannot inspect: refuse
         if stat.S_ISLNK(st.st_mode):
             hops += 1
             if hops > MAX_SYMLINK_HOPS:
-                return True                # cannot judge: refuse
+                return True, cur           # cannot judge: refuse
             try:
                 target = os.readlink(nxt)
             except OSError:
-                return True
+                return True, cur
             if _in_www(os.path.normpath(target if target.startswith("/") else os.path.join(cur, target))):
-                return True
+                return True, cur
             if target.startswith("/"):
                 cur = "/"
             parts = [p for p in target.split("/") if p] + parts
             continue
         cur = nxt
-    return _in_www(cur)
+    return _in_www(cur), cur
 
 
 def read_config_file(path):
@@ -320,14 +327,20 @@ def is_webspace_log(d, prefix=NGINX_PREFIX):
     # the variable may begin with '/', so the text before it can be a directory
     # itself (/var/www$x) as well as the start of a file name (/var/log/a$x);
     # and the variable may complete a path into the webspace (/var/w$x, /$x)
-    norm = os.path.normpath(path) if path else "/"
-    as_dir = pre.endswith("/") or norm == "/"
-    for w in {WWW_DIR, os.path.realpath(WWW_DIR)}:
-        # "/var/w$x" can become /var/www...; "/var/$x" can become /var/www/...;
-        # "/var/w/$x" cannot
-        if (w + "/").startswith(norm.rstrip("/") + "/") if as_dir else w.startswith(norm):
-            return True
-    return _reaches_www(path) or _reaches_www(os.path.dirname(path) or "/")
+    reaches, resolved = _walk(path)
+    if reaches or _reaches_www(os.path.dirname(path) or "/"):
+        return True
+    as_dir = pre.endswith("/")
+    # compare both the written and the symlink-resolved form ("//$x",
+    # "/etc/nginx/v/w$x" with v -> /var)
+    for form in {"/" + os.path.normpath(path).lstrip("/"), resolved}:
+        for w in {WWW_DIR, os.path.realpath(WWW_DIR)}:
+            # "/var/w$x" can become /var/www...; "/var/$x" can become /var/www/...;
+            # "/var/w/$x" cannot
+            if form == "/" or ((w + "/").startswith(form.rstrip("/") + "/") if as_dir
+                               else w.startswith(form)):
+                return True
+    return False
 
 
 def split_lines(text):

@@ -576,6 +576,15 @@ class FastcgiclearTests(unittest.TestCase):
         os.unlink(sites / "b-pending.conf")
         os.unlink(sites / "alias.conf")
         (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        # sites-enabled entries may be symlinks into sites-available
+        avail = self.tmp / "sites-available"
+        avail.mkdir()
+        (avail / "linked.conf").write_text(
+            "fastcgi_cache_path /c/linked levels=1:2;\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log l; }}\n")
+        (sites / "linked.conf").symlink_to(avail / "linked.conf")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p", "/c/linked"])
+        os.unlink(sites / "linked.conf")
         # a top-level include in a matched vhost could declare more zones
         zones = self.tmp / "zones.conf"
         zones.write_text("fastcgi_cache_path /c/zone levels=1:2;\n")
@@ -1225,6 +1234,22 @@ class NginxConfTests(unittest.TestCase):
         problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
         self.assertEqual(len(errors), 1)
         self.assertIn("missing.conf", errors[0])
+
+    def test_variable_prefix_through_symlinks_and_double_slash(self):
+        root = self._tree()
+        www = Path(tempfile.mkdtemp())
+        old = nc.WWW_DIR
+        nc.WWW_DIR = str(www)
+        self.addCleanup(setattr, nc, "WWW_DIR", old)
+        (root / "v").symlink_to(www.parent)          # a link to an ancestor of the webspace root
+        (root / "nginx.conf").write_text(
+            "access_log //$x;\n"
+            f"access_log {root}/v/{www.name[:4]}$x;\n"   # resolves to a prefix of the webspace
+            f"access_log {root}/v/$x;\n"                # a directory above it
+            f"access_log {root}/v/{www.name}x/$x;\n")   # a different directory: fine
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(problems), 3, problems)
 
     def test_special_destinations_per_directive(self):
         root = self._tree()
