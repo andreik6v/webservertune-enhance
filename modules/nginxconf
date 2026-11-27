@@ -247,8 +247,9 @@ def _expand_include(pat):
         if not os.path.lexists(pat):
             raise ConfError(f"include {pat} does not exist")
         return [pat]
-    if _UNSUPPORTED_GLOB & set(pat):
-        raise ConfError(f"unsupported include pattern {pat}")
+    if _UNSUPPORTED_GLOB & set(pat) or any(ord(c) > 127 for c in pat):
+        # non-ASCII bytes may match differently in libc's locale-dependent glob
+        raise ConfError(f"unsupported include pattern {pat!r}")
     d, name_pat = os.path.split(pat)
     d = d or "."
     if glob.has_magic(d):

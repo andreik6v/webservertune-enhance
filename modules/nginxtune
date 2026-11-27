@@ -205,6 +205,21 @@ RestartSec=15s
 StartLimitIntervalSec=0
 """
 
+def log_preflight_ok(logger, action):
+    """Whether nginx may be started, tested or reloaded: no access_log/error_log
+    anywhere in the include graph may reach into a webspace (nginx opens them as
+    root). Logs the reason when it may not."""
+    try:
+        problems, errors = _nginxconf().webspace_log_check(str(NGINX_CONF))
+    except Exception as e:
+        problems, errors = [], [f"preflight failed: {e}"]
+    if problems or errors:
+        logger.error(f"Not {action}: log destination check failed: "
+                     + "; ".join((problems + errors)[:5]))
+        return False
+    return True
+
+
 def _apply_restart_manage(config, logger):
     """Install or remove the nginx systemd drop-in based on the nginx_restart_manage setting."""
     enabled       = config.get("general", {}).get("nginx_restart_manage", False)
@@ -215,8 +230,11 @@ def _apply_restart_manage(config, logger):
             NGINX_DROPIN.parent.mkdir(parents=True, exist_ok=True)
             NGINX_DROPIN.write_text(DROPIN_CONTENT)
             subprocess.run(["systemctl", "daemon-reload"], check=True)
-            subprocess.run(["systemctl", "reload", "nginx"], check=True)
-            logger.warning("restart_manage: drop-in installed, daemon-reload and nginx reload done")
+            if log_preflight_ok(logger, "reloading nginx after installing the drop-in"):
+                subprocess.run(["systemctl", "reload", "nginx"], check=True)
+                logger.warning("restart_manage: drop-in installed, daemon-reload and nginx reload done")
+            else:
+                logger.warning("restart_manage: drop-in installed and daemon-reload done, nginx not reloaded")
         except Exception as e:
             logger.error(f"restart_manage: failed to install drop-in: {e}")
 
@@ -264,13 +282,7 @@ def run(config, logger):
         return
 
     # nginx -t opens every log file as root: check the destinations first
-    try:
-        problems, errors = _nginxconf().webspace_log_check(str(NGINX_CONF))
-    except Exception as e:
-        problems, errors = [], [f"preflight failed: {e}"]
-    if problems or errors:
-        logger.error("nginx config not tested or reloaded, log destination check failed: "
-                     + "; ".join((problems + errors)[:5]))
+    if not log_preflight_ok(logger, "testing or reloading the nginx config"):
         if _restore_backup(backup_dir, logger):
             logger.info("Configs restored from backup")
         _cleanup_backup(backup_dir, logger)
@@ -289,13 +301,8 @@ def run(config, logger):
     else:
         logger.error(f"nginx reload failed — restoring backup and restarting service")
         if _restore_backup(backup_dir, logger):
-            try:
-                problems, errors = _nginxconf().webspace_log_check(str(NGINX_CONF))
-            except Exception as e:
-                problems, errors = [], [str(e)]
-            if problems or errors:
-                logger.error("Not reloading the restored config, log destination check failed: "
-                             + "; ".join((problems + errors)[:5]))
+            if not log_preflight_ok(logger, "reloading the restored config"):
+                pass
             elif _reload_nginx(logger):
                 logger.info("Restored config reloaded successfully")
             else:
@@ -987,7 +994,10 @@ def apply_logging_features(config, logger):
             continue
 
         try:
-            legacy = [d for d in nc.parse(original) if d.name == "access_log" and nc.is_webspace_log(d)]
+            # a variable destination cannot be judged: it is not removed here, the
+            # preflight in run() refuses to test or reload while it exists
+            legacy = [d for d in nc.parse(original)
+                      if d.name == "access_log" and "$" not in d.args[0] and nc.is_webspace_log(d)]
             text   = nc.remove_directives(original, legacy)
             ds     = nc.parse(text)
         except nc.ConfError as e:

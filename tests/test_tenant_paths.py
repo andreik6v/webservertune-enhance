@@ -478,13 +478,13 @@ class FastcgiclearTests(unittest.TestCase):
             fcc.find_cache_paths(UUID)
         # directive text inside an argument or a comment is not a directive
         (sites / "alias.conf").write_text(
-            "add_header X-Doc \"fastcgi_cache_path /c/evil levels=1:2;\";\n"
-            "# fastcgi_cache_path /c/old levels=1:2;\n"
+            "add_header X-Doc \"fastcgi_cache_path /c/evil levels=1:2 keys_zone=c_evil_1:1m;\";\n"
+            "# fastcgi_cache_path /c/old levels=1:2 keys_zone=c_old_2:1m;\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
         # a vhost that mentions the webspace's log only in a comment is not the webspace's
         (sites / "alias.conf").write_text(
-            "fastcgi_cache_path /c/other levels=1:2;\n"
+            "fastcgi_cache_path /c/other levels=1:2 keys_zone=c_other_3:1m;\n"
             f"# access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n"
             "server { access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o; }\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
@@ -496,14 +496,14 @@ class FastcgiclearTests(unittest.TestCase):
         # the webspace log outside a server block, or from an included file,
         # could hide a vhost with its own cache zone: refuse
         (sites / "alias.conf").write_text(
-            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            "fastcgi_cache_path /c/hidden levels=1:2 keys_zone=c_hidden_4:1m;\n"
             f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\nserver {{ listen 80; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
         inc = self.tmp / "inc.conf"
         inc.write_text(f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
         (sites / "alias.conf").write_text(
-            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            "fastcgi_cache_path /c/hidden levels=1:2 keys_zone=c_hidden_5:1m;\n"
             f"server {{ include {inc}; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
@@ -511,7 +511,7 @@ class FastcgiclearTests(unittest.TestCase):
         # an include that disappears (or is not a regular file) makes the whole
         # answer unreliable, even for a vhost that does not name the webspace
         (sites / "alias.conf").write_text(
-            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            "fastcgi_cache_path /c/hidden levels=1:2 keys_zone=c_hidden_6:1m;\n"
             f"server {{ include {self.tmp}/gone.conf; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
@@ -554,7 +554,7 @@ class FastcgiclearTests(unittest.TestCase):
         # the server block)
         (self.tmp / "nginx.conf").write_text(f"http {{ include {sites}/*.conf; }}\n")
         (sites / "alias.conf").write_text(
-            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            "fastcgi_cache_path /c/hidden levels=1:2 keys_zone=c_hidden_7:1m;\n"
             f"server {{ include {sites}/alias-log.inc; }}\n")
         (sites / "alias-log.inc").write_text(
             f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
@@ -566,10 +566,10 @@ class FastcgiclearTests(unittest.TestCase):
         # include edited, not reloaded yet) may still be served: refuse
         (self.tmp / "nginx.conf").write_text(f"http {{ include {sites}/a*.conf; }}\n")
         (sites / "alias.conf").write_text(
-            "fastcgi_cache_path /c/other levels=1:2;\n"
+            "fastcgi_cache_path /c/other levels=1:2 keys_zone=c_other_8:1m;\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
         (sites / "b-pending.conf").write_text(
-            "fastcgi_cache_path /c/pending levels=1:2;\n"
+            "fastcgi_cache_path /c/pending levels=1:2 keys_zone=c_pending_9:1m;\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log p; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
@@ -581,7 +581,7 @@ class FastcgiclearTests(unittest.TestCase):
         jumpdst.mkdir(parents=True)
         (self.tmp / "elsewhere" / "sites-enabled").mkdir()
         (self.tmp / "elsewhere" / "sites-enabled" / "x.conf").write_text(
-            "fastcgi_cache_path /c/outside levels=1:2;\n"
+            "fastcgi_cache_path /c/outside levels=1:2 keys_zone=c_outside_10:1m;\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log x; }}\n")
         (self.tmp / "jump").symlink_to(jumpdst)
         (self.tmp / "nginx.conf").write_text(
@@ -594,7 +594,7 @@ class FastcgiclearTests(unittest.TestCase):
         frag = self.tmp / "frag.inc"
         frag.write_text(f"access_log /var/local/enhance/webserver_logs/{UUID}.log f;\n")
         (sites / "b-pending.conf").write_text(
-            f"fastcgi_cache_path /c/pending levels=1:2;\nserver {{ include {frag}; }}\n")
+            f"fastcgi_cache_path /c/pending levels=1:2 keys_zone=c_pending_11:1m;\nserver {{ include {frag}; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
         os.unlink(sites / "b-pending.conf")
@@ -616,14 +616,37 @@ class FastcgiclearTests(unittest.TestCase):
         avail = self.tmp / "sites-available"
         avail.mkdir()
         (avail / "linked.conf").write_text(
-            "fastcgi_cache_path /c/linked levels=1:2;\n"
+            "fastcgi_cache_path /c/linked levels=1:2 keys_zone=c_linked_12:1m;\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log l; }}\n")
         (sites / "linked.conf").symlink_to(avail / "linked.conf")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p", "/c/linked"])
         os.unlink(sites / "linked.conf")
+        # a zone must belong to one vhost: used elsewhere, or a vhost using a
+        # zone declared elsewhere, makes the purge ambiguous
+        (sites / "zz-other.conf").write_text("server { location / { fastcgi_cache a; } }\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "zz-other.conf")
+        (sites / "alias.conf").write_text(
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; fastcgi_cache a; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        # ... also a zone of an unrelated site
+        (sites / "zz-other.conf").write_text(
+            "fastcgi_cache_path /c/foreign levels=1:2 keys_zone=foreign:1m;\n"
+            "server { access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o; }\n")
+        (sites / "alias.conf").write_text(
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; fastcgi_cache foreign; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "zz-other.conf")
+        (sites / "alias.conf").write_text(
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; fastcgi_cache off; }}\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        os.unlink(sites / "alias.conf")
         # a top-level include in a matched vhost could declare more zones
         zones = self.tmp / "zones.conf"
-        zones.write_text("fastcgi_cache_path /c/zone levels=1:2;\n")
+        zones.write_text("fastcgi_cache_path /c/zone levels=1:2 keys_zone=c_zone_13:1m;\n")
         (sites / "alias.conf").write_text(
             f"include {zones};\n"
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
@@ -1119,6 +1142,16 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertIn('log_format example.com "$remote_addr";\nlog_format example.com_persistent ', text)
         nc.parse(text)
 
+    def test_variable_access_log_is_kept_not_deleted(self):
+        c = VHOST.replace("listen 80;", "listen 80;\naccess_log /var/log/nginx/$host.log example.com;")
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(False))
+        self.assertIn("access_log /var/log/nginx/$host.log example.com;", text)
+        # ... and run() refuses to test or reload while it exists
+        ngx_conf = self.tmp / "nginx.conf"
+        ngx_conf.write_text(f"http {{ include {ngx.SITES_DIR}/*.conf; }}\n")
+        self.assertFalse(ngx.log_preflight_ok(LOG, "testing"))
+
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code
         ngx.apply_logging_features(self.cfg(True), LOG)
@@ -1272,9 +1305,10 @@ class NginxConfTests(unittest.TestCase):
         files, errors = nc.include_graph(str(root / "nginx.conf"))
         self.assertEqual(errors, [])
         self.assertEqual(sorted(os.path.basename(g.file) for g in files), ["a.conf", "nginx.conf"])
-        (root / "nginx.conf").write_text("include conf.d/?.conf;\n")
-        _, errors = nc.include_graph(str(root / "nginx.conf"))
-        self.assertTrue(any("unsupported include pattern" in e for e in errors), errors)
+        for pat in ("conf.d/?.conf", "conf.d/\u00e9*.conf"):
+            (root / "nginx.conf").write_text(f"include {pat};\n")
+            _, errors = nc.include_graph(str(root / "nginx.conf"))
+            self.assertTrue(any("unsupported include pattern" in e for e in errors), (pat, errors))
 
     def test_missing_literal_include_is_an_error(self):
         root = self._tree()

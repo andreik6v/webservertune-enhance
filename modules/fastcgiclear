@@ -484,6 +484,9 @@ def find_cache_paths(uuid):
             raise UnsafePath(f"{cf.name} cannot be read completely: {perrors[0]}")
         if any(names_log(d) for g in pending for d in g.directives):
             raise UnsafePath(f"{cf.name} names the webspace but is not loaded as a vhost")
+    # every fastcgi_cache reference in the loaded configuration, by file
+    uses = [(g.file, d) for g in files for d in g.directives
+            if d.name == "fastcgi_cache" and d.args and not set(d.ctx) & nc.DATA_BLOCKS]
     paths = []
     for f, base in matched.items():
         ds = by_file[f]
@@ -491,11 +494,30 @@ def find_cache_paths(uuid):
         # fastcgi_cache_path directives; an http-level include could declare more
         if any(d.name == "include" and d.ctx == base for d in ds):
             raise UnsafePath(f"{os.path.basename(f)} includes other files at http level")
-        found = [Path(d.args[0]) for d in ds
-                 if d.name == "fastcgi_cache_path" and d.args and d.ctx == base]
-        if len(found) > 1:
-            raise UnsafePath(f"{os.path.basename(f)} has {len(found)} fastcgi_cache_path directives")
-        paths.extend(found)
+        decl = [d for d in ds if d.name == "fastcgi_cache_path" and d.args and d.ctx == base]
+        if len(decl) > 1:
+            raise UnsafePath(f"{os.path.basename(f)} has {len(decl)} fastcgi_cache_path directives")
+        zone = None
+        if decl:
+            zone = next((a.split("=", 1)[1].split(":", 1)[0] for a in decl[0].args[1:]
+                         if a.startswith("keys_zone=")), None)
+            if not zone:
+                raise UnsafePath(f"{os.path.basename(f)}: fastcgi_cache_path without keys_zone")
+        # the zone must belong to this vhost alone: used only from this file, and
+        # this file uses no other zone -- otherwise emptying it is someone else's
+        # purge too, or this site's cached pages live somewhere else
+        for uf, d in uses:
+            z = d.args[0]
+            if z == "off":
+                continue
+            if "$" in z:
+                raise UnsafePath(f"{uf}: fastcgi_cache with a variable zone")
+            same_file = os.path.realpath(uf) == os.path.realpath(f)
+            if z == zone and not same_file:
+                raise UnsafePath(f"cache zone {z} of {os.path.basename(f)} is also used by {uf}")
+            if same_file and z != zone:
+                raise UnsafePath(f"{os.path.basename(f)} uses cache zone {z} declared elsewhere")
+        paths.extend(Path(d.args[0]) for d in decl)
     return paths
 
 
