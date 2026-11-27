@@ -220,42 +220,76 @@ def read_config_file(path):
             os.close(fd)
 
 
+# one loaded occurrence of a config file: base is the effective context of
+# the include that loaded it (() for the main file); directives carry
+# base + their own blocks as ctx
+GraphFile = namedtuple("GraphFile", "file text directives base")
+
+MAX_INCLUDE_OCCURRENCES = 10000
+_UNSUPPORTED_GLOB = set("\\[]{}")
+
+
+def _expand_include(pat):
+    """Files an include pattern loads, or raise ConfError. Only plain * and ?
+    wildcards in the last path component are supported (escapes and character
+    classes may match differently from nginx's libc glob). A directory that does
+    not exist matches nothing, as in nginx; one that exists but cannot be listed
+    is an error rather than "no match"."""
+    if not glob.has_magic(pat):
+        if not os.path.lexists(pat):
+            raise ConfError(f"include {pat} does not exist")
+        return [pat]
+    if _UNSUPPORTED_GLOB & set(pat):
+        raise ConfError(f"unsupported include pattern {pat}")
+    d = os.path.dirname(pat) or "."
+    if glob.has_magic(d):
+        raise ConfError(f"unsupported include pattern {pat}")
+    try:
+        os.listdir(d)
+    except (FileNotFoundError, NotADirectoryError):
+        return []               # like nginx (glob(3) GLOB_NOMATCH): nothing to load
+    except OSError as e:
+        raise ConfError(f"include {pat}: {e}")
+    return sorted(glob.glob(pat))
+
+
 def include_graph(root, prefix=NGINX_PREFIX, conf_base=None):
-    """Return ([(file, text, directives)], errors) for root and every file it
-    includes, recursively, in nginx's load order. Each directive's ctx is its
-    effective context: the blocks around the include that pulled its file in,
-    followed by the blocks inside the file. Relative includes resolve against
-    conf_base, by default the directory of root (nginx's conf prefix when root
-    is the main config). Missing literal includes and unreadable, non-regular
-    or unparseable files are errors."""
+    """Return ([GraphFile], errors) for root and every file it includes,
+    recursively. A file included from several places appears once per place,
+    with that place's context; an include cycle is an error. Relative includes
+    resolve against conf_base, by default the directory of root (nginx's conf
+    prefix when root is the main config). Missing literal includes, include
+    directories that cannot be listed, unsupported patterns and unreadable,
+    non-regular or unparseable files are errors."""
     if conf_base is None:
         conf_base = os.path.dirname(os.path.abspath(root))
-    seen, out, errors = set(), [], []
-    stack = [(root, ())]
+    out, errors = [], []
+    stack = [(root, (), ())]
     while stack:
-        f, base_ctx = stack.pop()
+        f, base_ctx, chain = stack.pop()
+        if len(out) >= MAX_INCLUDE_OCCURRENCES:
+            errors.append(f"more than {MAX_INCLUDE_OCCURRENCES} included files")
+            break
         real = os.path.realpath(f)
-        if real in seen:
+        if real in chain:
+            errors.append(f"{f}: include cycle")
             continue
-        seen.add(real)
         try:
             text = read_config_file(f)
             ds = [d._replace(ctx=base_ctx + d.ctx, depth=len(base_ctx) + d.depth) for d in parse(text)]
         except (OSError, ConfError) as e:
             errors.append(f"{f}: {e}")
             continue
-        out.append((f, text, ds))
+        out.append(GraphFile(f, text, ds, base_ctx))
         children = []
         for d in ds:
-            if d.name != "include" or not d.args or set(d.ctx) & DATA_BLOCKS:
+            if d.name != "include" or not d.args:
                 continue
-            pat = _resolve(d.args[0], conf_base)
-            if glob.has_magic(pat):
-                children.extend((g, d.ctx) for g in sorted(glob.glob(pat)))
-            elif os.path.lexists(pat):
-                children.append((pat, d.ctx))
-            else:
-                errors.append(f"{f}: include {d.args[0]} does not exist")
+            try:
+                children.extend((g, d.ctx, chain + (real,))
+                                for g in _expand_include(_resolve(d.args[0], conf_base)))
+            except ConfError as e:
+                errors.append(f"{f}: {e}")
         stack.extend(reversed(children))
     return out, errors
 
@@ -287,8 +321,11 @@ def is_webspace_log(d, prefix=NGINX_PREFIX):
     # itself (/var/www$x) as well as the start of a file name (/var/log/a$x);
     # and the variable may complete a path into the webspace (/var/w$x, /$x)
     norm = os.path.normpath(path) if path else "/"
+    as_dir = pre.endswith("/") or norm == "/"
     for w in {WWW_DIR, os.path.realpath(WWW_DIR)}:
-        if w.startswith(norm):          # "/", "/var", "/var/w" can all become /var/www/...
+        # "/var/w$x" can become /var/www...; "/var/$x" can become /var/www/...;
+        # "/var/w/$x" cannot
+        if (w + "/").startswith(norm.rstrip("/") + "/") if as_dir else w.startswith(norm):
             return True
     return _reaches_www(path) or _reaches_www(os.path.dirname(path) or "/")
 
@@ -353,8 +390,8 @@ def webspace_log_check(root, prefix=NGINX_PREFIX):
     no access_log/error_log anywhere points into a webspace."""
     files, errors = include_graph(root, prefix)
     problems = []
-    for f, _text, ds in files:
-        problems += log_destination_problems(ds, prefix, where=f"{f}: ")
+    for g in files:
+        problems += log_destination_problems(g.directives, prefix, where=f"{g.file}: ")
     return problems, errors
 
 
@@ -363,8 +400,8 @@ if __name__ == "__main__":
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(NGINX_PREFIX, "nginx.conf")
     files, errors = include_graph(root)
     problems = []
-    for f, _t, ds in files:
-        problems += log_destination_problems(ds, where=f"{f}: ")
+    for g in files:
+        problems += log_destination_problems(g.directives, where=f"{g.file}: ")
     print(f"files={len(files)} webspace_logs={len(problems)} errors={len(errors)}")
     for p in problems:
         print("  BAD", p)

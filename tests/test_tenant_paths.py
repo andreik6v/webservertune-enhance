@@ -25,6 +25,34 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# Every temporary tree a test creates is removed when the run ends (tests make
+# directories unreadable, plant FIFOs and links, so restore permissions first).
+import atexit
+import shutil
+_made_tmp = []
+_real_mkdtemp = tempfile.mkdtemp
+
+
+def _mkdtemp(*a, **kw):
+    d = _real_mkdtemp(*a, **kw)
+    _made_tmp.append(d)
+    return d
+
+
+def _remove_tmp():
+    for d in _made_tmp:
+        for dirpath, dirnames, _files in os.walk(d, followlinks=False):
+            for n in dirnames:
+                try:
+                    os.chmod(os.path.join(dirpath, n), 0o700, follow_symlinks=False)
+                except (OSError, NotImplementedError):
+                    pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
+tempfile.mkdtemp = _mkdtemp
+atexit.register(_remove_tmp)
 UUID = "11111111-2222-3333-4444-555555555555"
 # When the suite runs as root (like the service), the fake webspace is given to an
 # unprivileged "tenant" uid, so ownership changes on victims are detected too.
@@ -520,6 +548,34 @@ class FastcgiclearTests(unittest.TestCase):
         inc.write_text(f"map $a $b {{ access_log /var/local/enhance/webserver_logs/{UUID}.log; }}\n")
         (sites / "alias.conf").write_text(f"include {inc};\n")
         self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        # a log fragment in sites-enabled, included into an alias's server block,
+        # is not a vhost of its own: refuse instead of missing the alias cache
+        # (nginx.conf loads only *.conf here, so the fragment is only seen inside
+        # the server block)
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {sites}/*.conf; }}\n")
+        (sites / "alias.conf").write_text(
+            "fastcgi_cache_path /c/hidden levels=1:2;\n"
+            f"server {{ include {sites}/alias-log.inc; }}\n")
+        (sites / "alias-log.inc").write_text(
+            f"access_log /var/local/enhance/webserver_logs/{UUID}.log al;\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "alias-log.inc")
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        # a vhost file on disk that names the webspace but is not loaded (an
+        # include edited, not reloaded yet) may still be served: refuse
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {sites}/a*.conf; }}\n")
+        (sites / "alias.conf").write_text(
+            "fastcgi_cache_path /c/other levels=1:2;\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; }}\n")
+        (sites / "b-pending.conf").write_text(
+            "fastcgi_cache_path /c/pending levels=1:2;\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log p; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "b-pending.conf")
+        os.unlink(sites / "alias.conf")
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
         # a top-level include in a matched vhost could declare more zones
         zones = self.tmp / "zones.conf"
         zones.write_text("fastcgi_cache_path /c/zone levels=1:2;\n")
@@ -1135,6 +1191,34 @@ class NginxConfTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("/var/www/x/y.log", problems[0])
 
+    def test_include_patterns_and_occurrences(self):
+        root = self._tree()
+        (root / "conf.d" / "[legacy]-a.conf").write_text("x;\n")
+        locked = root / "locked"
+        locked.mkdir()
+        (root / "inc.conf").write_text("y;\n")
+        (root / "loop.conf").write_text(f"include {root}/loop.conf;\n")
+        (root / "nginx.conf").write_text(
+            f"include conf.d/\\[legacy\\]-*.conf;\n"          # libc-only escaping: refused
+            "http { include inc.conf; server { include inc.conf; } }\n"
+            "map $a $b { include missing-map.conf; }\n"
+            "include loop.conf;\n"
+            "include no-such-dir/*.conf;\n")                  # nothing to load, like nginx
+        files, errors = nc.include_graph(str(root / "nginx.conf"))
+        self.assertTrue(any("unsupported include pattern" in e for e in errors), errors)
+        self.assertTrue(any("missing-map.conf" in e for e in errors), errors)
+        self.assertTrue(any("include cycle" in e for e in errors), errors)
+        self.assertFalse(any("no-such-dir" in e for e in errors), errors)
+        # the same file loaded in two places appears twice, with each context
+        self.assertEqual(sorted(g.base for g in files if g.file.endswith("inc.conf")),
+                         [("http",), ("http", "server")])
+        if not AS_ROOT:
+            os.chmod(locked, 0o000)
+            self.addCleanup(os.chmod, locked, 0o700)
+            (root / "nginx.conf").write_text(f"include {locked}/*.conf;\n")
+            _, errors = nc.include_graph(str(root / "nginx.conf"))
+            self.assertEqual(len(errors), 1, errors)
+
     def test_missing_literal_include_is_an_error(self):
         root = self._tree()
         (root / "nginx.conf").write_text("include missing.conf; include conf.d/none-*.conf;\n")
@@ -1234,6 +1318,7 @@ class NginxConfTests(unittest.TestCase):
             "error_log $var/c.log;\n"                      # literal path below the prefix: fine
             f"access_log {str(www)[:-2]}$x;\n"             # the variable can complete the webspace path
             "access_log /$x;\n"
+            f"access_log {str(www)[:-2]}/$host.log;\n"     # a different directory: fine
             "access_log off; error_log stderr; access_log syslog:server=x;\n"
             f"access_log {root}/fine.log;\n")
         problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
