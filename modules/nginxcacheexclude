@@ -51,8 +51,10 @@ SAFE_RULES = [
 
 # Rules that must ONLY be applied to detected WooCommerce sites.
 WOOCOMMERCE_RULES = [
-    "# WooCommerce: never cache store, cart, checkout, or account pages",
-    'if ($request_uri ~* "/cart.*|/checkout.*|/my-account.*|/store.*|/addons.*") {',
+    "# WooCommerce: never cache store, cart, checkout, or account pages.",
+    "# Whole path segments only (also /cart-2/, /store-checkout-.../, CartFlows",
+    "# steps), so /carti/ or /cartea-... in a bookshop stay cacheable.",
+    'if ($request_uri ~* "/(cart|checkout|my-account|store|addons|cartflows_step)(-[^/?]*)?(/|[?]|$)") {',
     "    set $skip_cache 1;",
     "}",
     "",
