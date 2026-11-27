@@ -942,16 +942,52 @@ def apply_include_features(config, logger):
 # apply_logging_features
 # ---------------------------------------------------------------------------
 
-def _persistent_log_format(fmt_name, ip_var, conn_ip_on):
+# Field names and nginx variables of the JSON persistent format, in order. Every
+# value is a JSON string (nginx's escape=json escapes quotes, backslashes and
+# control characters, so a client cannot shift or inject fields); unset values
+# are logged as "". It is a superset of the Enhance/cPFence access log
+# (bytes, request length, referer) and of the text persistent format.
+_JSON_LOG_FIELDS = (
+    ("time",          "$time_iso8601"),
+    ("msec",          "$msec"),
+    ("ip",            None),                    # ip_var: real visitor or TCP peer
+    ("peer",          "$realip_remote_addr"),   # TCP peer before realip rewrites it
+    ("cf_ray",        "$http_cf_ray"),
+    ("country",       "$http_cf_ipcountry"),
+    ("host",          "$host"),
+    ("method",        "$request_method"),
+    ("uri",           "$request_uri"),
+    ("protocol",      "$server_protocol"),
+    ("status",        "$status"),
+    ("bytes_sent",    "$bytes_sent"),
+    ("body_bytes",    "$body_bytes_sent"),
+    ("request_bytes", "$request_length"),
+    ("referer",       "$http_referer"),
+    ("ua",            "$http_user_agent"),
+    ("cache",         "$upstream_cache_status"),
+    ("request_time",  "$request_time"),
+    ("upstream_time", "$upstream_response_time"),
+)
+
+
+def _persistent_log_format(fmt_name, ip_var, conn_ip_on, json_on=False):
     """
     Build the persistent log_format line for a vhost.
 
-    With conn_ip_on, two fields are appended at the end (so parsers reading the
-    first 12 fields keep working): the address of the TCP peer before the realip
-    module rewrites it ($realip_remote_addr) and the Cloudflare Ray ID. Together
-    they show whether a request really came through Cloudflare or went straight
-    to the origin, and expose spoofed CF-Connecting-IP / X-Forwarded-For values.
+    With json_on, the line is one JSON object per request (escape=json) with all
+    fields of _JSON_LOG_FIELDS; connection_ip_logging is then irrelevant, since
+    the peer address and the Ray ID are always included.
+
+    Otherwise the text format is used. With conn_ip_on, two fields are appended
+    at the end (so parsers reading the first 12 fields keep working): the address
+    of the TCP peer before the realip module rewrites it ($realip_remote_addr)
+    and the Cloudflare Ray ID. Together they show whether a request really came
+    through Cloudflare or went straight to the origin, and expose spoofed
+    CF-Connecting-IP / X-Forwarded-For values.
     """
+    if json_on:
+        body = ",".join(f'"{k}":"{v if v is not None else ip_var}"' for k, v in _JSON_LOG_FIELDS)
+        return f"log_format {fmt_name}_persistent escape=json '{{{body}}}';\n"
     fmt = (
         f"log_format {fmt_name}_persistent "
         f"'$time_local - {ip_var} - $http_cf_ipcountry - "
@@ -987,6 +1023,7 @@ def apply_logging_features(config, logger):
     pers_on     = general.get("persistent_logging", False)
     realip_on   = features.get("real_ip_logging", False)
     conn_ip_on  = features.get("connection_ip_logging", False)
+    json_on     = features.get("json_logging", False)
     # ip_var is derived once here; all format strings must use this variable consistently
     ip_var      = "$actual_addr" if realip_on else "$remote_addr"
 
@@ -1081,7 +1118,7 @@ def apply_logging_features(config, logger):
                 want = _ensure_site_log_dir(uuid, logger)
 
         if want:
-            expected_fmt  = _persistent_log_format(base_fmt, ip_var, conn_ip_on).strip()
+            expected_fmt  = _persistent_log_format(base_fmt, ip_var, conn_ip_on, json_on).strip()
             expected_path = str(_site_log_path(uuid, "webserver.log"))
             expected_log  = f"access_log {expected_path} {base_fmt}_persistent;"
             ok_pers = (pers_logs == [[expected_path, f"{base_fmt}_persistent"]] * enh_logs
@@ -1123,7 +1160,7 @@ def apply_logging_features(config, logger):
                 else:
                     new_lines.append(line)
                 if want and i == base_fmt_idx:
-                    new_lines.append(_persistent_log_format(base_fmt, ip_var, conn_ip_on))
+                    new_lines.append(_persistent_log_format(base_fmt, ip_var, conn_ip_on, json_on))
                     pers_fmt_added = True
 
             elif (d.name == "fastcgi_cache_path" and realip_on
