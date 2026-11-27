@@ -984,7 +984,7 @@ def _docroot_from_conf_lines(lines):
     return None
 
 
-def _xmlrpc_block_wanted(lines):
+def _xmlrpc_block_wanted(lines, docroot=None):
     """
     True if this vhost serves WordPress and no Jetpack plugin is installed.
 
@@ -994,7 +994,8 @@ def _xmlrpc_block_wanted(lines):
     connection still relies on xmlrpc.php. Errors default to False, so a site is
     never blocked when it can't be inspected.
     """
-    docroot = _docroot_from_conf_lines(lines)
+    if docroot is None:
+        docroot = _docroot_from_conf_lines(lines)
     if not docroot or not docroot.is_dir():
         return False
     candidates = [docroot]
@@ -1016,21 +1017,278 @@ def _xmlrpc_block_wanted(lines):
     return is_wp
 
 
+WWW_DIR                = Path("/var/www")
+WOO_DETECT_MAX_ENTRIES = 500
+
+
+def _open_dir_chain(base_fd, parts):
+    """Open a sequence of subdirectories below base_fd with O_NOFOLLOW. Returns new fd or None."""
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    cur = os.dup(base_fd)
+    try:
+        for part in parts:
+            if part in ("", ".", "..") or "/" in part:
+                os.close(cur)
+                return None
+            nxt = os.open(part, dir_flags, dir_fd=cur)
+            os.close(cur)
+            cur = nxt
+        return cur
+    except OSError:
+        try:
+            os.close(cur)
+        except OSError:
+            pass
+        return None
+
+
+def _open_tenant_docroot(docroot, logger=None):
+    """Open a docroot below WWW_DIR walking every tenant-controlled component with O_NOFOLLOW."""
+    if not docroot:
+        return None
+    try:
+        rel = Path(docroot).relative_to(WWW_DIR)
+    except ValueError:
+        if logger:
+            logger.debug(f"woo_bot_protection: skipping docroot outside {WWW_DIR}: {docroot}")
+        return None
+    if not rel.parts:
+        return None
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        www_fd = os.open(WWW_DIR, dir_flags)
+    except OSError as e:
+        if logger:
+            logger.debug(f"woo_bot_protection: cannot open {WWW_DIR}: {e}")
+        return None
+    try:
+        fd = _open_dir_chain(www_fd, rel.parts)
+        if fd is None and logger:
+            logger.debug(f"woo_bot_protection: skipping {docroot} (missing or symlinked component)")
+        return fd
+    finally:
+        os.close(www_fd)
+
+
+def _is_regular_file_at(dir_fd, *rel_parts):
+    """True iff walking rel_parts below dir_fd with O_NOFOLLOW lands on a regular file."""
+    parent_fd = _open_dir_chain(dir_fd, rel_parts[:-1]) if len(rel_parts) > 1 else os.dup(dir_fd)
+    if parent_fd is None:
+        return False
+    try:
+        st = os.stat(rel_parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        return stat.S_ISREG(st.st_mode)
+    except OSError:
+        return False
+    finally:
+        os.close(parent_fd)
+
+
+def _dir_has_woocommerce(dir_fd):
+    """True iff dir_fd is a WordPress root with WooCommerce installed (no symlinks followed)."""
+    return (_is_regular_file_at(dir_fd, "wp-load.php")
+            and _is_regular_file_at(dir_fd, "wp-content", "plugins", "woocommerce", "woocommerce.php"))
+
+
+def _woo_bot_block_wanted(lines, logger=None, docroot=None):
+    """
+    True if this vhost serves a WordPress site with WooCommerce installed.
+
+    Opens the docroot relative to WWW_DIR walking every component with
+    O_NOFOLLOW, checks the docroot first, then up to WOO_DETECT_MAX_ENTRIES
+    immediate directory entries (all entries count toward the cap) for
+    WordPress installed in a subdirectory. Requires regular marker files so
+    tenant-controlled symlinks are never followed and wide directories cannot
+    stall the Nginx config lock. Errors default to False.
+    """
+    if docroot is None:
+        docroot = _docroot_from_conf_lines(lines)
+    root_fd = _open_tenant_docroot(docroot, logger)
+    if root_fd is None:
+        return False
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        if _dir_has_woocommerce(root_fd):
+            return True
+        seen = 0
+        with os.scandir(root_fd) as it:
+            for entry in it:
+                seen += 1
+                if seen > WOO_DETECT_MAX_ENTRIES:
+                    if logger:
+                        logger.debug(
+                            f"woo_bot_protection: scan cap ({WOO_DETECT_MAX_ENTRIES}) reached in {docroot}"
+                        )
+                    break
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    sub_fd = os.open(entry.name, dir_flags, dir_fd=root_fd)
+                except OSError:
+                    continue
+                try:
+                    if _dir_has_woocommerce(sub_fd):
+                        return True
+                finally:
+                    os.close(sub_fd)
+        return False
+    except OSError as e:
+        if logger:
+            logger.debug(f"woo_bot_protection: scan error in {docroot}: {e}")
+        return False
+    finally:
+        os.close(root_fd)
+
+
+def _domain_allowlist(features, key, logger):
+    """Parse a list of domain stems from settings; warn and treat as empty if not a list."""
+    raw = features.get(key, [])
+    if not isinstance(raw, list):
+        logger.warning(f"{key}: expected a list of domains, got {type(raw).__name__}; ignoring")
+        return set()
+    return {d.strip().lower() for d in raw if isinstance(d, str) and d.strip()}
+
+
+def _find_block_close(text, open_brace_end):
+    """
+    Return the exact character offset of the closing `}` matching the `{`
+    immediately preceding open_brace_end in valid nginx config text. Follows
+    nginxconf's tokenization rules (quoted strings, `#` comments at token start,
+    backslash escapes, and `${var}` expansions).
+    """
+    depth = 1
+    i, n = open_brace_end, len(text)
+    at_token_start = True
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n":
+            at_token_start = True
+            i += 1
+            continue
+        if at_token_start and ch == "#":
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            at_token_start = True
+            continue
+        if at_token_start and ch in "\"'":
+            q = ch
+            i += 1
+            while i < n:
+                if text[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            at_token_start = False
+            continue
+        if ch == "\\" and i + 1 < n:
+            at_token_start = False
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "{":
+            at_token_start = False
+            i += 2
+            continue
+        if ch == "{":
+            depth += 1
+            at_token_start = True
+            i += 1
+            continue
+        if ch == "}":
+            if at_token_start:
+                depth -= 1
+                if depth == 0:
+                    return i
+                at_token_start = True
+            i += 1
+            continue
+        if ch == ";":
+            at_token_start = True
+            i += 1
+            continue
+        at_token_start = False
+        i += 1
+    return None
+
+
+def _is_legacy_managed_override(target, inc_filename):
+    """True only for non-canonical paths from an older webservertune/nginxtune overrides dir."""
+    p = Path(target)
+    return (p.name == inc_filename
+            and p.parent.name == "overrides"
+            and p.parent.parent.name.startswith(("webservertune", "nginxtune")))
+
+
+def _server_block_specs(text, nc):
+    """
+    Parse text with nginxconf and return one dict per top-level `server { ... }`
+    block: {"start_pos", "close_pos", "start_line", "directives", "all_directives"}.
+    `directives` are direct children (ctx == ("server",)); `all_directives`
+    includes nested directives (e.g. inside `location`) so misplaced managed
+    includes from older versions are still cleaned up cleanly.
+    Returns None if text cannot be parsed.
+    """
+    try:
+        ds = nc.parse(text)
+    except nc.ConfError:
+        return None
+    top_indices = [idx for idx, d in enumerate(ds) if d.depth == 0]
+    blocks = []
+    for pos, idx in enumerate(top_indices):
+        d = ds[idx]
+        if d.name != "server" or d.term != "{":
+            continue
+        close_pos = _find_block_close(text, d.end)
+        if close_pos is None:
+            return None
+        next_idx = top_indices[pos + 1] if pos + 1 < len(top_indices) else len(ds)
+        sub = ds[idx + 1:next_idx]
+        children = [c for c in sub if c.ctx == ("server",)]
+        blocks.append({
+            "start_pos": d.start,
+            "close_pos": close_pos,
+            "start_line": d.line_start,
+            "directives": children,
+            "all_directives": sub,
+        })
+    return blocks
+
+
+def _line_indent_at(text, offset):
+    """Leading whitespace of the line containing offset."""
+    b = text.rfind("\n", 0, offset) + 1
+    j = b
+    while j < len(text) and text[j] in " \t":
+        j += 1
+    return text[b:j]
+
+
 def apply_include_features(config, logger):
     """
     Add or remove managed include directives (ssl, hardening, cms, xmlrpc,
-    redirects) from all non-default vhost confs. Inserts after the vhost_includes
-    line, or before the closing brace if that line is absent.
+    woo-bot, redirects) per `server` block in all non-default vhost confs using
+    nginxconf directive offsets. Inserts after that server block's server-level
+    `include vhost_includes/...` directive, or before its closing brace if absent.
 
-    The xmlrpc include is per vhost: it is added only to WordPress sites without
-    a Jetpack plugin and not listed in xmlrpc_allow_domains.
+    The xmlrpc include is per server block: added only where WordPress is
+    detected without a Jetpack plugin and the vhost is not in xmlrpc_allow_domains.
+    The woo-bot include is per server block: added only where WordPress with
+    WooCommerce is detected under WWW_DIR and the vhost is not in woo_bot_allow_domains.
     """
+    nc              = _nginxconf()
     features        = config.get("nginx", {}).get("features", {})
     redirects_on    = config.get("general", {}).get("nginx_redirects", False)
     cacheexclude_on = config.get("nginx-cacheexclude", {}).get("enabled", False)
     xmlrpc_on       = features.get("xmlrpc_protection", False)
-    xmlrpc_allow    = {d.strip().lower() for d in features.get("xmlrpc_allow_domains", []) if d.strip()}
+    xmlrpc_allow    = _domain_allowlist(features, "xmlrpc_allow_domains", logger)
     xmlrpc_inc      = f"include {OVERRIDES}/xmlrpc.conf"
+    woo_bot_on      = features.get("woo_bot_protection", False)
+    woo_bot_allow   = _domain_allowlist(features, "woo_bot_allow_domains", logger)
+    woo_bot_inc     = f"include {OVERRIDES}/woo-bot.conf"
 
     if cacheexclude_on:
         CACHE_EXCLUDES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1042,7 +1300,8 @@ def apply_include_features(config, logger):
     }
 
     expected   = [v for k, v in include_map.items() if features.get(k, False)]
-    manageable = list(include_map.values()) + [xmlrpc_inc]
+    manageable = list(include_map.values()) + [xmlrpc_inc, woo_bot_inc]
+    managed_filenames = {Path(v).name for v in manageable}
 
     conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
     any_changed = False
@@ -1065,102 +1324,181 @@ def apply_include_features(config, logger):
                     logger.error(f"Failed to create placeholder cache-exclude for {cf.stem}: {e}")
 
         try:
-            lines = cf.read_text().splitlines(keepends=True)
+            original = cf.read_text()
         except Exception as e:
             logger.error(f"Failed to read {filename}: {e}")
             continue
 
-        want_xmlrpc     = (xmlrpc_on and cf.stem.lower() not in xmlrpc_allow
-                           and _xmlrpc_block_wanted(lines))
-        file_expected   = (expected
-                           + ([xmlrpc_inc] if want_xmlrpc else [])
-                           + ([redirect_inc] if redirects_on else [])
-                           + ([cacheexc_inc] if cacheexclude_on else []))
-        file_manageable = manageable + [redirect_inc, cacheexc_inc]
-
-        current  = []
-        unwanted = []
-        managed_filenames = {Path(v).name for v in manageable}
-
-        for line in lines:
-            s = line.strip()
-            if not s.startswith("include "):
-                continue
-            if s.rstrip(";") == redirect_inc:
-                current.append(redirect_inc)
-                continue
-            if s.rstrip(";") == cacheexc_inc:
-                current.append(cacheexc_inc)
-                continue
-            inc_filename = Path(s.rstrip(";").split()[-1]).name
-            if inc_filename not in managed_filenames:
-                continue
-            canonical = next(v for v in manageable if Path(v).name == inc_filename)
-            if s.rstrip(";") == canonical:
-                current.append(canonical)
-            else:
-                unwanted.append(s.rstrip(";"))
-
-        to_add    = [i for i in file_expected if i not in current]
-        to_remove = [i for i in file_manageable if i in current and i not in file_expected]
-
-        if not to_add and not to_remove and not unwanted:
+        blocks = _server_block_specs(original, nc)
+        if blocks is None:
+            logger.warning(f"include_features: {filename} cannot be parsed, leaving unchanged")
+            continue
+        if not blocks:
             continue
 
-        new_lines        = []
-        includes_written = False
+        file_manageable = manageable + [redirect_inc, cacheexc_inc]
+        canonical_set   = set(file_manageable)
 
-        for i, line in enumerate(lines):
-            s = line.strip()
+        def _compute_expected(blk):
+            server_root = next((Path(d.args[0]) for d in blk["directives"]
+                                if d.name == "root" and d.args), None)
+            want_xmlrpc  = (xmlrpc_on and cf.stem.lower() not in xmlrpc_allow
+                            and server_root is not None
+                            and _xmlrpc_block_wanted((), docroot=server_root))
+            want_woo_bot = (woo_bot_on and cf.stem.lower() not in woo_bot_allow
+                            and server_root is not None
+                            and _woo_bot_block_wanted((), logger, docroot=server_root))
+            return (expected
+                    + ([xmlrpc_inc] if want_xmlrpc else [])
+                    + ([woo_bot_inc] if want_woo_bot else [])
+                    + ([redirect_inc] if redirects_on else [])
+                    + ([cacheexc_inc] if cacheexclude_on else []))
 
-            skip = False
-            for inc in to_remove + unwanted:
-                if s == f"{inc};" or s == inc:
-                    skip = True
-                    break
-            if skip:
+        def _plan_block(blk, blk_expected):
+            current = []
+            vhost_inc_d = None
+            blk_inc_dirs = {}   # canonical_inc -> [Directive, ...]
+            unwanted_dirs = []
+            nested_rm_dirs = []
+
+            for d in blk["directives"]:
+                if d.name != "include" or not d.args:
+                    continue
+                target = d.args[0]
+                if target.startswith("vhost_includes/") and vhost_inc_d is None:
+                    vhost_inc_d = d
+                    continue
+                full = f"include {target}"
+                if full in canonical_set:
+                    current.append(full)
+                    blk_inc_dirs.setdefault(full, []).append(d)
+                    continue
+                inc_filename = Path(target).name
+                if inc_filename in managed_filenames and _is_legacy_managed_override(target, inc_filename):
+                    unwanted_dirs.append(d)
+
+            # Also clean any managed include misplaced inside a nested block (e.g.
+            # inserted inside a location by an older version before upgrade), so
+            # disabling cache-excludes or redirects never leaves a dangling include.
+            for d in blk["all_directives"]:
+                if d.ctx == ("server",) or d.name != "include" or not d.args:
+                    continue
+                target = d.args[0]
+                full = f"include {target}"
+                if full in canonical_set:
+                    nested_rm_dirs.append((full, d))
+                    continue
+                inc_filename = Path(target).name
+                if inc_filename in managed_filenames and _is_legacy_managed_override(target, inc_filename):
+                    unwanted_dirs.append(d)
+
+            to_add    = [i for i in blk_expected if i not in current]
+            to_remove = [i for i in file_manageable if i in current and i not in blk_expected]
+            for full, _ in nested_rm_dirs:
+                if full not in blk_expected and full not in to_remove:
+                    to_remove.append(full)
+            rm_dirs = (
+                [d for inc in to_remove for d in blk_inc_dirs.get(inc, ())]
+                + [d for _, d in nested_rm_dirs]
+                + unwanted_dirs
+            )
+            return to_add, to_remove, rm_dirs, len(unwanted_dirs), vhost_inc_d
+
+        # Pass 1: detect once per block and remove unwanted / disabled directives
+        expected_per_blk = [_compute_expected(blk) for blk in blocks]
+        to_remove_dirs = []
+        all_removed    = []
+        unwanted_count = 0
+        any_to_add     = False
+        for blk, blk_expected in zip(blocks, expected_per_blk):
+            to_add, to_remove, rm_dirs, n_unw, _ = _plan_block(blk, blk_expected)
+            if to_add:
+                any_to_add = True
+            to_remove_dirs.extend(rm_dirs)
+            unwanted_count += n_unw
+            for inc in to_remove:
+                if inc not in all_removed:
+                    all_removed.append(inc)
+
+        if not any_to_add and not to_remove_dirs:
+            continue
+
+        text = nc.remove_directives(original, to_remove_dirs) if to_remove_dirs else original
+
+        # Pass 2: insert missing directives at exact character offsets
+        all_added = []
+        if any_to_add:
+            blocks2 = _server_block_specs(text, nc)
+            if blocks2 is None or len(blocks2) != len(expected_per_blk):
+                logger.error(f"include_features: {filename} failed to re-parse after removal, leaving unchanged")
                 continue
-
-            new_lines.append(line)
-
-            if "include vhost_includes/" in line and not includes_written:
-                base = _indent(lines, i)
+            insertions = []  # (offset, snippet)
+            for blk, blk_expected in zip(blocks2, expected_per_blk):
+                to_add, _, _, _, vhost_inc_d = _plan_block(blk, blk_expected)
+                if not to_add:
+                    continue
                 for inc in to_add:
-                    new_lines.append(f"{base}{inc};\n")
-                includes_written = True
+                    if inc not in all_added:
+                        all_added.append(inc)
+                if vhost_inc_d is not None:
+                    nl = text.find("\n", vhost_inc_d.end)
+                    tail = text[vhost_inc_d.end:(len(text) if nl < 0 else nl)].strip()
+                    if tail == "" or tail.startswith("#"):
+                        base = _line_indent_at(text, vhost_inc_d.start)
+                        snippet = "".join(f"{base}{inc};\n" for inc in to_add)
+                        if nl < 0:
+                            insertions.append((len(text), "\n" + snippet))
+                        else:
+                            insertions.append((nl + 1, snippet))
+                    else:
+                        insertions.append((vhost_inc_d.end, " " + " ".join(f"{inc};" for inc in to_add)))
+                else:
+                    close_pos = blk["close_pos"]
+                    line_start = text.rfind("\n", 0, close_pos) + 1
+                    if text[line_start:close_pos].strip() == "":
+                        base = _line_indent_at(text, blk["start_pos"]) + "    "
+                        snippet = "".join(f"{base}{inc};\n" for inc in to_add)
+                        insertions.append((line_start, snippet))
+                    else:
+                        insertions.append((close_pos, " " + " ".join(f"{inc};" for inc in to_add) + " "))
+            for off, snippet in sorted(insertions, key=lambda x: x[0], reverse=True):
+                text = text[:off] + snippet + text[off:]
 
-        # fallback: insert before closing brace if vhost_includes line was not found
-        if not includes_written and to_add:
-            for j in range(len(new_lines) - 1, -1, -1):
-                if new_lines[j].strip() == "}":
-                    for inc in to_add:
-                        new_lines.insert(j, f"{inc};\n")
-                    includes_written = True
-                    break
+        if text == original:
+            continue
+        try:
+            nc.parse(text)
+        except nc.ConfError as e:
+            logger.error(f"include_features: rebuilt {filename} would not parse ({e}), leaving unchanged")
+            continue
 
         try:
-            _write(cf, "".join(new_lines))
+            _write(cf, text)
             parts = []
-            if to_add:
-                names = [k for k, v in include_map.items() if v in to_add]
-                if xmlrpc_inc in to_add:
+            if all_added:
+                names = [k for k, v in include_map.items() if v in all_added]
+                if xmlrpc_inc in all_added:
                     names.append("xmlrpc_protection")
-                if redirect_inc in to_add:
+                if woo_bot_inc in all_added:
+                    names.append("woo_bot_protection")
+                if redirect_inc in all_added:
                     names.append("nginx_redirects")
-                if cacheexc_inc in to_add:
+                if cacheexc_inc in all_added:
                     names.append("cache_exclude")
                 parts.append(f"added {', '.join(names)}")
-            if to_remove:
-                names = [k for k, v in include_map.items() if v in to_remove]
-                if xmlrpc_inc in to_remove:
+            if all_removed:
+                names = [k for k, v in include_map.items() if v in all_removed]
+                if xmlrpc_inc in all_removed:
                     names.append("xmlrpc_protection")
-                if redirect_inc in to_remove:
+                if woo_bot_inc in all_removed:
+                    names.append("woo_bot_protection")
+                if redirect_inc in all_removed:
                     names.append("nginx_redirects")
-                if cacheexc_inc in to_remove:
+                if cacheexc_inc in all_removed:
                     names.append("cache_exclude")
                 parts.append(f"removed {', '.join(names)}")
-            if unwanted:
-                parts.append(f"cleaned {len(unwanted)} legacy includes")
+            if unwanted_count:
+                parts.append(f"cleaned {unwanted_count} legacy includes")
             logger.warning(f"include_features: {'; '.join(parts)} — {filename}")
             any_changed = True
         except Exception as e:
