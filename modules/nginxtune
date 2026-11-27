@@ -75,9 +75,18 @@ def _in_server(d):
     return "server" in d.ctx and not set(d.ctx) & _nginxconf().DATA_BLOCKS
 
 
+_PERS_LOG_RE = None
+
+
 def _is_pers_log(d):
-    return (d.name == "access_log" and bool(d.args) and _in_server(d)
-            and d.args[0].startswith(f"{SITE_LOGS_DIR}/"))
+    """Exactly a persistent access_log this service writes:
+    SITE_LOGS_DIR/<uuid>/webserver.log, no variables."""
+    global _PERS_LOG_RE
+    if _PERS_LOG_RE is None or _PERS_LOG_RE[0] != str(SITE_LOGS_DIR):
+        _PERS_LOG_RE = (str(SITE_LOGS_DIR), re.compile(re.escape(str(SITE_LOGS_DIR)) + "/"
+                        + _UUID_RE.pattern + "/webserver\\.log", re.IGNORECASE))
+    return (d.name == "access_log" and len(d.args) >= 1 and _in_server(d)
+            and bool(_PERS_LOG_RE[1].fullmatch(d.args[0])))
 
 
 def _is_pers_fmt(d):
@@ -997,7 +1006,8 @@ def apply_logging_features(config, logger):
             # a variable destination cannot be judged: it is not removed here, the
             # preflight in run() refuses to test or reload while it exists
             legacy = [d for d in nc.parse(original)
-                      if d.name == "access_log" and "$" not in d.args[0] and nc.is_webspace_log(d)]
+                      if d.name == "access_log" and d.args and "$" not in d.args[0]
+                      and nc.is_webspace_log(d)]
             text   = nc.remove_directives(original, legacy)
             ds     = nc.parse(text)
         except nc.ConfError as e:

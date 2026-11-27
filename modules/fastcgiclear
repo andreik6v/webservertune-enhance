@@ -484,9 +484,13 @@ def find_cache_paths(uuid):
             raise UnsafePath(f"{cf.name} cannot be read completely: {perrors[0]}")
         if any(names_log(d) for g in pending for d in g.directives):
             raise UnsafePath(f"{cf.name} names the webspace but is not loaded as a vhost")
-    # every fastcgi_cache reference in the loaded configuration, by file
-    uses = [(g.file, d) for g in files for d in g.directives
+    # every fastcgi_cache reference in the loaded configuration, with the files
+    # it belongs to (its own and every file that included it)
+    uses = [({os.path.realpath(g.file), *g.chain}, g.file, d) for g in files for d in g.directives
             if d.name == "fastcgi_cache" and d.args and not set(d.ctx) & nc.DATA_BLOCKS]
+    enhance_logs = [({os.path.realpath(g.file), *g.chain}, g.file, d) for g in files for d in g.directives
+                    if d.name == "access_log" and d.args
+                    and d.args[0].startswith("/var/local/enhance/webserver_logs/")]
     paths = []
     for f, base in matched.items():
         ds = by_file[f]
@@ -506,13 +510,19 @@ def find_cache_paths(uuid):
         # the zone must belong to this vhost alone: used only from this file, and
         # this file uses no other zone -- otherwise emptying it is someone else's
         # purge too, or this site's cached pages live somewhere else
-        for uf, d in uses:
+        real_f = os.path.realpath(f)
+        # one vhost file per site: another webspace's log in it (or in a file it
+        # includes) means its zone may serve two sites
+        for owners, lf, d in enhance_logs:
+            if real_f in owners and d.args[0] != want_log:
+                raise UnsafePath(f"{os.path.basename(f)} also serves another webspace ({lf})")
+        for owners, uf, d in uses:
             z = d.args[0]
             if z == "off":
                 continue
             if "$" in z:
                 raise UnsafePath(f"{uf}: fastcgi_cache with a variable zone")
-            same_file = os.path.realpath(uf) == os.path.realpath(f)
+            same_file = real_f in owners
             if z == zone and not same_file:
                 raise UnsafePath(f"cache zone {z} of {os.path.basename(f)} is also used by {uf}")
             if same_file and z != zone:

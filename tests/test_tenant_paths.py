@@ -631,6 +631,24 @@ class FastcgiclearTests(unittest.TestCase):
             f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; fastcgi_cache a; }}\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
+        # ... also through a location include inside the alias's server block
+        (sites / "zz-other.conf").write_text(
+            "fastcgi_cache_path /c/foreign levels=1:2 keys_zone=foreign:1m;\n"
+            "server { access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o; }\n")
+        loc = self.tmp / "loc.inc"
+        loc.write_text("fastcgi_cache foreign;\n")
+        (sites / "alias.conf").write_text(
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; location / {{ include {loc}; }} }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "zz-other.conf")
+        # two sites grouped in one vhost file: its zone may serve both
+        (sites / "alias.conf").write_text(
+            "fastcgi_cache_path /c/both levels=1:2 keys_zone=both:1m;\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log al; fastcgi_cache both; }}\n"
+            "server { access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o; fastcgi_cache both; }\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
         # ... also a zone of an unrelated site
         (sites / "zz-other.conf").write_text(
             "fastcgi_cache_path /c/foreign levels=1:2 keys_zone=foreign:1m;\n"
@@ -1152,6 +1170,14 @@ class NginxtuneMigrationTests(unittest.TestCase):
         ngx_conf.write_text(f"http {{ include {ngx.SITES_DIR}/*.conf; }}\n")
         self.assertFalse(ngx.log_preflight_ok(LOG, "testing"))
 
+    def test_variable_and_argumentless_logs_under_site_logs_dir_kept(self):
+        c = VHOST.replace("listen 80;", f"listen 80;\naccess_log {ngx.SITE_LOGS_DIR}/$host/webserver.log example.com;")
+        self.conf.write_text(c)
+        text = self.settle(self.cfg(False))
+        self.assertIn(f"access_log {ngx.SITE_LOGS_DIR}/$host/webserver.log example.com;", text)
+        self.conf.write_text(VHOST.replace("listen 80;", "listen 80;\naccess_log;"))
+        ngx.apply_logging_features(self.cfg(True), LOG)       # must not raise
+
     def test_no_webspace_writes(self):
         # nothing under a fake /var/www may be created by the logging code
         ngx.apply_logging_features(self.cfg(True), LOG)
@@ -1215,6 +1241,50 @@ class NginxtuneRunPreflightTests(unittest.TestCase):
         ngx.NGINX_CONF.write_text("http { access_log /var/log/nginx/access.log; }\n")
         ngx.run({}, LOG)
         self.assertEqual(self.calls, ["test", "reload"])
+
+
+nrd = load("nginxredirects")
+
+
+class NginxRedirectsTests(unittest.TestCase):
+    """Redirect rules come from the tenant's .htaccess and end up in nginx config
+    loaded by root: nothing that could close the location may get through."""
+
+    def item(self, target, pattern=None, code="301", host="^(www.)?example.com$"):
+        conds = [{"testString": "%{HTTP_HOST}", "condPattern": host}]
+        if pattern is not None:
+            conds.append({"testString": "%{REQUEST_URI}", "condPattern": pattern})
+        return {"conds": conds, "rule": {"substitution": target, "flags": [f"R={code}"]}}
+
+    def test_plain_rules_translate_as_before(self):
+        out = nrd.translate_rules([
+            self.item("https://new.example.com%{REQUEST_URI}"),
+            self.item("https://new.example.com/b%{REQUEST_URI}", pattern="/old/", code="302"),
+        ], LOG)
+        self.assertEqual(out["example.com"], [
+            "location ~ ^(?!/.well-known)(.*)$ {\n    return 301 https://new.example.com$request_uri;\n}",
+            "location ~ ^/old/(.*)$ {\n    return 302 https://new.example.com/b$1;\n}",
+        ])
+        nc.parse("server {\n" + "\n".join(out["example.com"]) + "\n}\n")
+
+    def test_injection_attempts_are_skipped(self):
+        evil_targets = [
+            "https://x; } location /l { alias /etc/; } location /y { return 301 y",
+            "https://x;fastcgi_pass",
+            "https://x}",
+            'https://x"',
+            "https://x'",
+            "#https://x",
+            "https://x\nreturn",
+            "https://x\\",
+        ]
+        for t in evil_targets:
+            self.assertEqual(nrd.translate_rules([self.item(t)], LOG), {}, t)
+        for p in ("/a{2}", "/a b", "/a;", "/a}", "/a#", '/a"'):
+            self.assertEqual(nrd.translate_rules([self.item("https://x", pattern=p)], LOG), {}, p)
+        for c in ("301;}", "200", "301 x"):
+            self.assertEqual(nrd.translate_rules([self.item("https://x", code=c)], LOG), {}, c)
+        self.assertEqual(nrd.translate_rules([self.item("https://x", host="^../../etc$")], LOG), {})
 
 
 class NginxConfTests(unittest.TestCase):

@@ -231,7 +231,8 @@ def read_config_file(path):
 # one loaded occurrence of a config file: base is the effective context of
 # the include that loaded it (() for the main file); directives carry
 # base + their own blocks as ctx
-GraphFile = namedtuple("GraphFile", "file text directives base")
+# chain: realpaths of the files that included it, outermost first
+GraphFile = namedtuple("GraphFile", "file text directives base chain")
 
 MAX_INCLUDE_OCCURRENCES = 10000
 _UNSUPPORTED_GLOB = set("\\[]{}?")
@@ -293,7 +294,7 @@ def include_graph(root, prefix=NGINX_PREFIX, conf_base=None):
         except (OSError, ConfError) as e:
             errors.append(f"{f}: {e}")
             continue
-        out.append(GraphFile(f, text, ds, base_ctx))
+        out.append(GraphFile(f, text, ds, base_ctx, chain))
         children = []
         for d in ds:
             if d.name != "include" or not d.args:
