@@ -11,6 +11,7 @@ Nothing here runs nginx: `nginx -t` already opens every log file as root,
 so checks on log destinations must happen before it.
 """
 
+import fnmatch
 import glob
 import os
 import re
@@ -233,31 +234,35 @@ def read_config_file(path):
 GraphFile = namedtuple("GraphFile", "file text directives base")
 
 MAX_INCLUDE_OCCURRENCES = 10000
-_UNSUPPORTED_GLOB = set("\\[]{}")
+_UNSUPPORTED_GLOB = set("\\[]{}?")
 
 
 def _expand_include(pat):
-    """Files an include pattern loads, or raise ConfError. Only plain * and ?
-    wildcards in the last path component are supported (escapes and character
-    classes may match differently from nginx's libc glob). A directory that does
-    not exist matches nothing, as in nginx; one that exists but cannot be listed
-    is an error rather than "no match"."""
+    """Files an include pattern loads, or raise ConfError. Only '*' wildcards in
+    the last path component are supported: escapes, '?' and character classes
+    may match differently from nginx's libc glob (locale, bytes). The directory
+    is listed exactly once; one that does not exist matches nothing, as in
+    nginx, one that cannot be listed is an error rather than "no match"."""
     if not glob.has_magic(pat):
         if not os.path.lexists(pat):
             raise ConfError(f"include {pat} does not exist")
         return [pat]
     if _UNSUPPORTED_GLOB & set(pat):
         raise ConfError(f"unsupported include pattern {pat}")
-    d = os.path.dirname(pat) or "."
+    d, name_pat = os.path.split(pat)
+    d = d or "."
     if glob.has_magic(d):
         raise ConfError(f"unsupported include pattern {pat}")
     try:
-        os.listdir(d)
+        names = os.listdir(d)
     except (FileNotFoundError, NotADirectoryError):
         return []               # like nginx (glob(3) GLOB_NOMATCH): nothing to load
     except OSError as e:
         raise ConfError(f"include {pat}: {e}")
-    return sorted(glob.glob(pat))
+    # glob(3): '*' does not match a leading '.'
+    hits = [n for n in names if fnmatch.fnmatchcase(n, name_pat)
+            and (not n.startswith(".") or name_pat.startswith("."))]
+    return [os.path.join(d, n) for n in sorted(hits)]
 
 
 def include_graph(root, prefix=NGINX_PREFIX, conf_base=None):
@@ -304,7 +309,7 @@ def include_graph(root, prefix=NGINX_PREFIX, conf_base=None):
 def is_webspace_log(d, prefix=NGINX_PREFIX):
     """True if d is an access_log/error_log whose destination is /var/www or
     below (directly, through a symlinked directory or file, or with '..'), or
-    cannot be judged because it starts with a variable. Rows of data blocks
+    cannot be judged because it contains a variable. Rows of data blocks
     such as map are not directives and never count."""
     if d.name not in ("access_log", "error_log") or not d.args or set(d.ctx) & DATA_BLOCKS:
         return False
@@ -320,27 +325,10 @@ def is_webspace_log(d, prefix=NGINX_PREFIX):
     if d.name == "error_log" or "$" not in dest:
         # error_log never expands variables: nginx opens the literal path
         return _reaches_www(_resolve(dest, prefix))
-    if dest.startswith("$"):
-        return True
-    pre  = dest.split("$", 1)[0]
-    path = _resolve(pre, prefix)
-    # the variable may begin with '/', so the text before it can be a directory
-    # itself (/var/www$x) as well as the start of a file name (/var/log/a$x);
-    # and the variable may complete a path into the webspace (/var/w$x, /$x)
-    reaches, resolved = _walk(path)
-    if reaches or _reaches_www(os.path.dirname(path) or "/"):
-        return True
-    as_dir = pre.endswith("/")
-    # compare both the written and the symlink-resolved form ("//$x",
-    # "/etc/nginx/v/w$x" with v -> /var)
-    for form in {"/" + os.path.normpath(path).lstrip("/"), resolved}:
-        for w in {WWW_DIR, os.path.realpath(WWW_DIR)}:
-            # "/var/w$x" can become /var/www...; "/var/$x" can become /var/www/...;
-            # "/var/w/$x" cannot
-            if form == "/" or ((w + "/").startswith(form.rstrip("/") + "/") if as_dir
-                               else w.startswith(form)):
-                return True
-    return False
+    # a variable can expand to anything, '../' included: nginx workers open such
+    # paths at request time, and whether the result stays out of a webspace
+    # cannot be judged here (none of the servers uses them)
+    return True
 
 
 def split_lines(text):

@@ -444,7 +444,9 @@ def find_cache_paths(uuid):
     def is_vhost_file(f):
         # by the directory it is listed in, not its target (sites-enabled
         # entries may be symlinks into sites-available)
-        return (os.path.realpath(os.path.dirname(os.path.abspath(f))) == vhost_dir
+        # realpath of the parent as written: abspath() would collapse '..'
+        # before symlinks are followed
+        return (os.path.realpath(os.path.dirname(f) or ".") == vhost_dir
                 and not os.path.basename(f).startswith("000-"))
 
     def names_log(d):
@@ -468,21 +470,16 @@ def find_cache_paths(uuid):
         raise UnsafePath("no vhost names this webspace")
     # a vhost file on disk that names the webspace but is not part of the loaded
     # graph (e.g. an include edited but not reloaded yet) may still be served
+    # (its includes are followed too)
     matched_real = {os.path.realpath(f) for f in matched}
     for cf in sorted(SITES_DIR.iterdir()):
-        if os.path.realpath(cf) in matched_real or not is_vhost_file(cf):
+        if os.path.realpath(cf) in matched_real or not is_vhost_file(str(cf)):
             continue
-        try:
-            text = nc.read_config_file(str(cf))
-        except (OSError, nc.ConfError) as e:
-            raise UnsafePath(f"{cf.name} cannot be read: {e}")
-        if want_log in text:
-            try:
-                ds = nc.parse(text)
-            except nc.ConfError as e:
-                raise UnsafePath(f"{cf.name} cannot be parsed: {e}")
-            if any(names_log(d) for d in ds):
-                raise UnsafePath(f"{cf.name} names the webspace but is not loaded as a vhost")
+        pending, perrors = nc.include_graph(str(cf), conf_base=str(NGINX_CONF_DIR))
+        if perrors:
+            raise UnsafePath(f"{cf.name} cannot be read completely: {perrors[0]}")
+        if any(names_log(d) for g in pending for d in g.directives):
+            raise UnsafePath(f"{cf.name} names the webspace but is not loaded as a vhost")
     paths = []
     for f, base in matched.items():
         ds = by_file[f]

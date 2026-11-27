@@ -576,6 +576,29 @@ class FastcgiclearTests(unittest.TestCase):
         os.unlink(sites / "b-pending.conf")
         os.unlink(sites / "alias.conf")
         (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        # a path that only looks like sites-enabled after collapsing '..' is not
+        jumpdst = self.tmp / "elsewhere" / "nested"
+        jumpdst.mkdir(parents=True)
+        (self.tmp / "elsewhere" / "sites-enabled").mkdir()
+        (self.tmp / "elsewhere" / "sites-enabled" / "x.conf").write_text(
+            "fastcgi_cache_path /c/outside levels=1:2;\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log x; }}\n")
+        (self.tmp / "jump").symlink_to(jumpdst)
+        (self.tmp / "nginx.conf").write_text(
+            f"http {{ include {self.tmp}/sites-enabled/*; include {self.tmp}/jump/../sites-enabled/x.conf; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
+        # a pending vhost whose log comes from an include outside sites-enabled
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {sites}/a*.conf; }}\n")
+        frag = self.tmp / "frag.inc"
+        frag.write_text(f"access_log /var/local/enhance/webserver_logs/{UUID}.log f;\n")
+        (sites / "b-pending.conf").write_text(
+            f"fastcgi_cache_path /c/pending levels=1:2;\nserver {{ include {frag}; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        os.unlink(sites / "b-pending.conf")
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
         # sites-enabled entries may be symlinks into sites-available
         avail = self.tmp / "sites-available"
         avail.mkdir()
@@ -1228,6 +1251,18 @@ class NginxConfTests(unittest.TestCase):
             _, errors = nc.include_graph(str(root / "nginx.conf"))
             self.assertEqual(len(errors), 1, errors)
 
+    def test_include_question_mark_and_dotfiles(self):
+        root = self._tree()
+        (root / "conf.d" / "a.conf").write_text("x;\n")
+        (root / "conf.d" / ".hidden.conf").write_text("y;\n")
+        (root / "nginx.conf").write_text("include conf.d/*.conf;\n")
+        files, errors = nc.include_graph(str(root / "nginx.conf"))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(os.path.basename(g.file) for g in files), ["a.conf", "nginx.conf"])
+        (root / "nginx.conf").write_text("include conf.d/?.conf;\n")
+        _, errors = nc.include_graph(str(root / "nginx.conf"))
+        self.assertTrue(any("unsupported include pattern" in e for e in errors), errors)
+
     def test_missing_literal_include_is_an_error(self):
         root = self._tree()
         (root / "nginx.conf").write_text("include missing.conf; include conf.d/none-*.conf;\n")
@@ -1246,10 +1281,10 @@ class NginxConfTests(unittest.TestCase):
             "access_log //$x;\n"
             f"access_log {root}/v/{www.name[:4]}$x;\n"   # resolves to a prefix of the webspace
             f"access_log {root}/v/$x;\n"                # a directory above it
-            f"access_log {root}/v/{www.name}x/$x;\n")   # a different directory: fine
+            f"access_log {root}/v/{www.name}x/$x;\n")   # a value with '../' could still escape
         problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
         self.assertEqual(errors, [])
-        self.assertEqual(len(problems), 3, problems)
+        self.assertEqual(len(problems), 4, problems)
 
     def test_special_destinations_per_directive(self):
         root = self._tree()
@@ -1343,12 +1378,13 @@ class NginxConfTests(unittest.TestCase):
             "error_log $var/c.log;\n"                      # literal path below the prefix: fine
             f"access_log {str(www)[:-2]}$x;\n"             # the variable can complete the webspace path
             "access_log /$x;\n"
-            f"access_log {str(www)[:-2]}/$host.log;\n"     # a different directory: fine
+            f"access_log {str(www)[:-2]}/$host.log;\n"     # any variable: refused
             "access_log off; error_log stderr; access_log syslog:server=x;\n"
             f"access_log {root}/fine.log;\n")
         problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
         self.assertEqual(errors, [])
-        self.assertEqual(len(problems), 7, problems)
+        # every access_log with a variable is refused; error_log is literal
+        self.assertEqual(len(problems), 8, problems)
         self.assertFalse(any("c.log" in p for p in problems))
 
 
