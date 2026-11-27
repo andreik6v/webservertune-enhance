@@ -1142,6 +1142,22 @@ class NginxConfTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("missing.conf", errors[0])
 
+    def test_special_destinations_per_directive(self):
+        root = self._tree()
+        www = Path(tempfile.mkdtemp())
+        old = nc.WWW_DIR
+        nc.WWW_DIR = str(www)
+        self.addCleanup(setattr, nc, "WWW_DIR", old)
+        (www / "site").mkdir()
+        for name in ("off", "stderr", "memory:x"):
+            (root / name).symlink_to(www / "site" / name)
+        (root / "nginx.conf").write_text(
+            "access_log off; error_log stderr; error_log memory:1m; access_log syslog:server=x;\n"
+            "error_log off; access_log stderr; access_log memory:x;\n")   # literal files here
+        problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(problems), 3, problems)
+
     def test_symlink_chain_and_relative_includes(self):
         root = self._tree()
         www = Path(tempfile.mkdtemp())
@@ -1216,11 +1232,13 @@ class NginxConfTests(unittest.TestCase):
             f"access_log {www}$x;\n"                       # the variable may start with '/'
             f"error_log {www}/site/$x.log;\n"              # error_log: literal path, inside
             "error_log $var/c.log;\n"                      # literal path below the prefix: fine
+            f"access_log {str(www)[:-2]}$x;\n"             # the variable can complete the webspace path
+            "access_log /$x;\n"
             "access_log off; error_log stderr; access_log syslog:server=x;\n"
             f"access_log {root}/fine.log;\n")
         problems, errors = nc.webspace_log_check(str(root / "nginx.conf"), prefix=str(root))
         self.assertEqual(errors, [])
-        self.assertEqual(len(problems), 5, problems)
+        self.assertEqual(len(problems), 7, problems)
         self.assertFalse(any("c.log" in p for p in problems))
 
 

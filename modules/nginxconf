@@ -268,7 +268,13 @@ def is_webspace_log(d, prefix=NGINX_PREFIX):
     if d.name not in ("access_log", "error_log") or not d.args or set(d.ctx) & DATA_BLOCKS:
         return False
     dest = d.args[0]
-    if dest == "off" or dest == "stderr" or dest.startswith(("syslog:", "memory:")):
+    # special destinations differ per directive; anything else is a file path
+    # (e.g. `error_log off;` writes a file called "off")
+    if dest.startswith("syslog:"):
+        return False
+    if d.name == "access_log" and dest == "off":
+        return False
+    if d.name == "error_log" and (dest == "stderr" or dest.startswith("memory:")):
         return False
     if d.name == "error_log" or "$" not in dest:
         # error_log never expands variables: nginx opens the literal path
@@ -278,7 +284,12 @@ def is_webspace_log(d, prefix=NGINX_PREFIX):
     pre  = dest.split("$", 1)[0]
     path = _resolve(pre, prefix)
     # the variable may begin with '/', so the text before it can be a directory
-    # itself (/var/www$x) as well as the start of a file name (/var/log/a$x)
+    # itself (/var/www$x) as well as the start of a file name (/var/log/a$x);
+    # and the variable may complete a path into the webspace (/var/w$x, /$x)
+    norm = os.path.normpath(path) if path else "/"
+    for w in {WWW_DIR, os.path.realpath(WWW_DIR)}:
+        if w.startswith(norm):          # "/", "/var", "/var/w" can all become /var/www/...
+            return True
     return _reaches_www(path) or _reaches_www(os.path.dirname(path) or "/")
 
 
