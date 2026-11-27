@@ -523,6 +523,9 @@ def find_cache_paths(uuid):
             if "$" in z:
                 raise UnsafePath(f"{uf}: fastcgi_cache with a variable zone")
             same_file = real_f in owners
+            if d.ctx == ("http",) and not same_file:
+                # set at http level elsewhere: inherited by every server
+                raise UnsafePath(f"{uf}: fastcgi_cache {z} at http level applies to all sites")
             if z == zone and not same_file:
                 raise UnsafePath(f"cache zone {z} of {os.path.basename(f)} is also used by {uf}")
             if same_file and z != zone:

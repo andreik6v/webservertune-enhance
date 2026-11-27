@@ -380,7 +380,7 @@ def remove_directives(text, directives):
 
 def log_destination_problems(directives, prefix=NGINX_PREFIX, where=""):
     """access_log/error_log destinations that resolve to /var/www or below, or
-    that cannot be judged (a path starting with a variable)."""
+    that cannot be judged (an access_log path containing a variable)."""
     bad = []
     for d in directives:
         if is_webspace_log(d, prefix):

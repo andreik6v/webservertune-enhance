@@ -649,6 +649,20 @@ class FastcgiclearTests(unittest.TestCase):
             "server { access_log /var/local/enhance/webserver_logs/99999999-2222-3333-4444-555555555555.log o; fastcgi_cache both; }\n")
         with self.assertRaises(fcc.UnsafePath):
             fcc.find_cache_paths(UUID)
+        # a vhost_includes-style file using the vhost's own zone is fine
+        os.unlink(sites / "alias.conf")
+        own = self.tmp / "own.inc"
+        own.write_text("fastcgi_cache a;\n")
+        (sites / "a.conf").write_text(
+            "fastcgi_cache_path /c/a levels=1:2 keys_zone=a:10m;\n"
+            f"server {{ access_log /var/local/enhance/webserver_logs/{UUID}.log a; include {own}; }}\n")
+        self.assertEqual(sorted(map(str, fcc.find_cache_paths(UUID))), ["/c/a", "/c/a p"])
+        # a zone set at http level in nginx.conf is inherited by every site
+        (self.tmp / "nginx.conf").write_text(
+            f"http {{ fastcgi_cache shared; include {self.tmp}/sites-enabled/*; }}\n")
+        with self.assertRaises(fcc.UnsafePath):
+            fcc.find_cache_paths(UUID)
+        (self.tmp / "nginx.conf").write_text(f"http {{ include {self.tmp}/sites-enabled/*; }}\n")
         # ... also a zone of an unrelated site
         (sites / "zz-other.conf").write_text(
             "fastcgi_cache_path /c/foreign levels=1:2 keys_zone=foreign:1m;\n"
