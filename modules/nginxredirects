@@ -19,6 +19,9 @@ SITES_DIR     = Path("/etc/nginx/sites-enabled")
 REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
 WWW_DIR       = Path("/var/www")
 HTACCESS_FILE = ".htaccess"
+# Shared with nginxtune (see nginxconf.nginx_lock): redirect files change and
+# nginx is tested/reloaded only while no nginxtune run is half-way through.
+NGINX_LOCK    = Path("/run/webservertune-enhance.nginx.lock")
 
 UUID_RE = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
@@ -118,15 +121,25 @@ def translate_rules(items, logger):
     return rules_by_domain
 
 
+_nginxconf_mod = None
+
+
 def _nginxconf():
-    from importlib.machinery import SourceFileLoader
-    import importlib.util
-    path   = Path(__file__).resolve().parent / "nginxconf"
-    loader = SourceFileLoader("nginxconf", str(path))
-    spec   = importlib.util.spec_from_loader("nginxconf", loader)
-    mod    = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    global _nginxconf_mod
+    if _nginxconf_mod is None:
+        from importlib.machinery import SourceFileLoader
+        import importlib.util
+        path   = Path(__file__).resolve().parent / "nginxconf"
+        loader = SourceFileLoader("nginxconf", str(path))
+        spec   = importlib.util.spec_from_loader("nginxconf", loader)
+        mod    = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _nginxconf_mod = mod
+    return _nginxconf_mod
+
+
+def _lock():
+    return _nginxconf().nginx_lock(NGINX_LOCK)
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +182,8 @@ def watch(config, logger, api_client):
 
     def _write_conf(domain, rules):
         """
-        Write redirect conf file for a domain.
-        Returns True if the file content changed, False otherwise.
+        Write redirect conf file for a domain, atomically. The caller holds
+        the nginx config lock. Returns True if the file content changed.
         """
         path    = REDIRECTS_DIR / f"{domain}.conf"
         content = "\n".join(rules) + "\n" if rules else ""
@@ -178,7 +191,7 @@ def watch(config, logger, api_client):
             existing = path.read_text() if path.exists() else None
             if existing == content:
                 return False
-            path.write_text(content)
+            _nginxconf().write_atomic(path, content)
             logger.info(f"[{domain}] Written {len(rules)} redirect(s)")
             return True
         except Exception as e:
@@ -187,6 +200,10 @@ def watch(config, logger, api_client):
 
     def _reload_nginx():
         """Test nginx config and reload if valid. Logs and skips reload if test fails."""
+        with _lock():
+            _reload_nginx_locked()
+
+    def _reload_nginx_locked():
         # nginx -t opens every log file as root: same log destination check as nginxtune
         try:
             problems, errors = _nginxconf().webspace_log_check("/etc/nginx/nginx.conf")
@@ -271,10 +288,11 @@ def watch(config, logger, api_client):
         domains         = _domains_for_uuid(uuid)
         changed         = False
 
-        for domain in domains:
-            rules = rules_by_domain.get(domain, [])
-            if _write_conf(domain, rules):
-                changed = True
+        with _lock():
+            for domain in domains:
+                rules = rules_by_domain.get(domain, [])
+                if _write_conf(domain, rules):
+                    changed = True
 
         return changed
 
@@ -367,25 +385,31 @@ def watch(config, logger, api_client):
         remove conf files for domains no longer present.
         """
         current_domains = set()
-        for cf in _site_confs():
-            domain = cf.stem
-            current_domains.add(domain)
-            conf = REDIRECTS_DIR / f"{domain}.conf"
-            if not conf.exists():
-                _write_conf(domain, [])
-                uuid = _extract_uuid_from_conf(cf)
-                if uuid:
-                    _register_uuid(uuid)
-                    if _sync_uuid(uuid):
-                        _reload_nginx()
+        new_uuids       = []
+        with _lock():
+            for cf in _site_confs():
+                domain = cf.stem
+                current_domains.add(domain)
+                conf = REDIRECTS_DIR / f"{domain}.conf"
+                if not conf.exists():
+                    _write_conf(domain, [])
+                    uuid = _extract_uuid_from_conf(cf)
+                    if uuid:
+                        new_uuids.append(uuid)
 
-        for conf in REDIRECTS_DIR.glob("*.conf"):
-            if conf.stem not in current_domains:
-                try:
-                    conf.unlink()
-                    logger.info(f"Removed stale redirect conf: {conf.name}")
-                except Exception as e:
-                    logger.error(f"Failed to remove {conf.name}: {e}")
+            for conf in REDIRECTS_DIR.glob("*.conf"):
+                if conf.stem not in current_domains:
+                    try:
+                        conf.unlink()
+                        logger.info(f"Removed stale redirect conf: {conf.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove {conf.name}: {e}")
+
+        # API calls and the reload take the lock themselves
+        for uuid in new_uuids:
+            _register_uuid(uuid)
+            if _sync_uuid(uuid):
+                _reload_nginx()
 
     def _sites_watcher_loop():
         """Watch sites-enabled for vhost additions and removals, triggering a debounced rescan."""
@@ -420,9 +444,10 @@ def watch(config, logger, api_client):
                 if "CREATE" in event or "MOVED_TO" in event:
                     domain = Path(fname).stem
                     conf   = REDIRECTS_DIR / f"{domain}.conf"
-                    if not conf.exists():
-                        _write_conf(domain, [])
-                        logger.debug(f"Created empty conf for new vhost: {domain}")
+                    with _lock():
+                        if not conf.exists():
+                            _write_conf(domain, [])
+                            logger.debug(f"Created empty conf for new vhost: {domain}")
 
                 with sites_debounce_lock:
                     if sites_debounce_timer[0] is not None:
@@ -445,15 +470,16 @@ def watch(config, logger, api_client):
         Clear existing redirect confs, register all current vhosts, and sync
         redirect rules for all sites in parallel.
         """
-        try:
-            for f in REDIRECTS_DIR.glob("*.conf"):
-                f.unlink()
-            logger.info("Cleared existing redirect conf files")
-        except Exception as e:
-            logger.error(f"Failed to clear redirects dir: {e}")
+        with _lock():
+            try:
+                for f in REDIRECTS_DIR.glob("*.conf"):
+                    f.unlink()
+                logger.info("Cleared existing redirect conf files")
+            except Exception as e:
+                logger.error(f"Failed to clear redirects dir: {e}")
 
-        for cf in _site_confs():
-            _write_conf(cf.stem, [])
+            for cf in _site_confs():
+                _write_conf(cf.stem, [])
 
         site_uuids = []
         for cf in _site_confs():

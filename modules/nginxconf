@@ -398,6 +398,79 @@ def webspace_log_check(root, prefix=NGINX_PREFIX):
     return problems, errors
 
 
+# ---------------------------------------------------------------------------
+# Writing config files
+# ---------------------------------------------------------------------------
+
+# Temporary files start with "." and do not end in ".conf": `include dir/*`
+# (glob(3)) and the services' inotify filters never pick them up.
+_TMP_SUFFIX = ".wst-tmp"
+
+
+def write_atomic(path, data):
+    """Replace path with data (str or bytes) in one rename, so nginx -t or a
+    reload never reads a half-written file. An existing file keeps its mode and
+    owner; a new one is 0644. A symlink is followed to its target in this trusted
+    root-owned tree (sites-enabled entries may be links), the link is kept."""
+    path = os.fspath(path)
+    if os.path.islink(path):
+        path = os.path.realpath(path)
+    if isinstance(data, str):
+        data = data.encode()
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        st = None
+    d, name = os.path.split(path)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=f".{name}.", suffix=_TMP_SUFFIX, dir=d or ".")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if st is not None and stat.S_ISREG(st.st_mode):
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+            if os.geteuid() == 0:
+                os.chown(tmp, st.st_uid, st.st_gid)
+        else:
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+class nginx_lock:
+    """Exclusive lock around everything that changes nginx config files, runs
+    nginx -t or reloads nginx (nginxtune, nginxredirects). flock() locks belong
+    to the open file, so it excludes other threads of the service as well as
+    other processes. Not reentrant: never take it twice in one thread."""
+
+    def __init__(self, path):
+        self.path = os.fspath(path)
+        self.fd = None
+
+    def __enter__(self):
+        import fcntl
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self.fd)
+            self.fd = None
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)        # releases the lock
+        self.fd = None
+        return False
+
+
 if __name__ == "__main__":
     import sys
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(NGINX_PREFIX, "nginx.conf")

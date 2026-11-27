@@ -1293,7 +1293,8 @@ class NginxtuneRunPreflightTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.saved = {k: getattr(ngx, k) for k in (
-            "NGINX_CONF", "_create_backup", "_restore_backup", "_cleanup_backup",
+            "NGINX_CONF", "NGINX_LOCK", "FAILED_STATE", "OVERRIDES_STATE", "SITES_DIR", "CACHE_EXCLUDES_DIR",
+            "REDIRECTS_DIR", "_create_backup", "_cleanup_backup",
             "_cleanup_old_backups", "_test_nginx", "_reload_nginx", "apply_nginx_conf",
             "apply_http3_enable", "apply_quic_gso_enable", "_apply_cache_excludes",
             "apply_include_features", "apply_logging_features", "apply_fastcgi_cache_settings",
@@ -1301,8 +1302,22 @@ class NginxtuneRunPreflightTests(unittest.TestCase):
         self.addCleanup(lambda: [setattr(ngx, k, v) for k, v in self.saved.items()])
         self.calls = []
         ngx.NGINX_CONF = self.tmp / "nginx.conf"
+        ngx.NGINX_LOCK = self.tmp / "nginx.lock"
+        ngx.FAILED_STATE = self.tmp / "failed-run"
+        ngx.OVERRIDES_STATE = self.tmp / "overrides-loaded"
+        for k in ("SITES_DIR", "CACHE_EXCLUDES_DIR", "REDIRECTS_DIR"):
+            setattr(ngx, k, self.tmp / k.lower())
         ngx._create_backup = lambda logger: self.tmp
-        ngx._restore_backup = lambda b, logger: self.calls.append("restore") or True
+        self.on_restore = None
+        old_undo = ngx._Changes.undo
+        self.addCleanup(setattr, ngx._Changes, "undo", old_undo)
+
+        def undo(changes, logger):
+            if self.on_restore:
+                self.on_restore()
+            self.calls.append("restore")
+            return True
+        ngx._Changes.undo = undo
         ngx._cleanup_backup = lambda b, logger: None
         ngx._cleanup_old_backups = lambda days, logger: None
         ngx._test_nginx = lambda: (self.calls.append("test") or (True, ""))
@@ -1328,12 +1343,10 @@ class NginxtuneRunPreflightTests(unittest.TestCase):
         self.addCleanup(setattr, _logging, "shutdown", old_shutdown)
         ngx.NGINX_CONF.write_text("http { access_log /var/log/nginx/access.log; }\n")
 
-        def restore(b, logger):
+        def restore():
             # the "previous" config that comes back has a webspace log
             ngx.NGINX_CONF.write_text(f"http {{ access_log /var/www/{UUID}/x.log; }}\n")
-            self.calls.append("restore")
-            return True
-        ngx._restore_backup = restore
+        self.on_restore = restore
         ngx._reload_nginx = lambda logger: self.calls.append("reload") or False
         ngx.run({}, LOG)
         self.assertEqual(self.calls, ["test", "reload", "restore"])

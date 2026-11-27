@@ -7,7 +7,9 @@ Called by webservertune-enhance main program.
 """
 
 import grp
+import hashlib
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -26,6 +28,22 @@ BACKUP_BASE   = Path("/opt/webservertune-enhance/backups/nginx")
 OVERRIDES     = Path("/opt/webservertune-enhance/overrides")
 REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
 CACHE_EXCLUDES_DIR = Path("/opt/webservertune-enhance/cache-excludes")
+
+# Shared with nginxredirects: held while config files change, nginx -t runs or
+# nginx reloads (see nginxconf.nginx_lock).
+NGINX_LOCK    = Path("/run/webservertune-enhance.nginx.lock")
+# The inputs of the last run that failed and was undone. A run with the same
+# inputs would fail the same way, and its undo would trigger the next run
+# through inotify, so it is not retried until something changes or
+# RETRY_AFTER seconds pass. In /run, so it survives a service restart (the
+# reload-failure path exits) but not a reboot.
+FAILED_STATE  = Path("/run/webservertune-enhance.failed-run")
+RETRY_AFTER   = 3600
+# Hash of overrides/*.conf as nginx last loaded them. Those files change with
+# the code, not the vhosts, so after an update the include lines are already in
+# place and a run finds nothing to do: without this, new rules would wait for
+# an unrelated reload. Missing (boot, first start) means reload once.
+OVERRIDES_STATE = Path("/run/webservertune-enhance.overrides-loaded")
 
 # Persistent per-site logs live in a root-owned tree outside the webspaces.
 # They used to be written to /var/www/<uuid>/logs/, which the site user can
@@ -127,7 +145,7 @@ def _apply_cache_excludes(config, logger):
             spec   = importlib.util.spec_from_loader("nginxcacheexclude", loader)
             _cacheexclude_mod = importlib.util.module_from_spec(spec)
             loader.exec_module(_cacheexclude_mod)
-        return _cacheexclude_mod.apply(config, logger)
+        return _cacheexclude_mod.apply(config, logger, fs=_FS)
     except Exception as e:
         logger.error(f"cache-exclude apply failed: {e}")
         return False
@@ -231,6 +249,11 @@ def log_preflight_ok(logger, action):
 
 def _apply_restart_manage(config, logger):
     """Install or remove the nginx systemd drop-in based on the nginx_restart_manage setting."""
+    with _nginxconf().nginx_lock(NGINX_LOCK):
+        _apply_restart_manage_locked(config, logger)
+
+
+def _apply_restart_manage_locked(config, logger):
     enabled       = config.get("general", {}).get("nginx_restart_manage", False)
     dropin_exists = NGINX_DROPIN.exists()
 
@@ -266,63 +289,280 @@ def _apply_restart_manage(config, logger):
 def run(config, logger):
     """
     Back up all vhost confs and nginx.conf, apply all configured features, test with
-    nginx -t, reload nginx if changed, or restore from backup and exit if reload fails.
+    nginx -t, reload nginx if changed, or undo every file change of the run. Holds
+    the nginx config lock throughout, so overlapping runs (startup, inotify
+    debounce) and nginxredirects never see a half-applied config.
     """
+    with _nginxconf().nginx_lock(NGINX_LOCK):
+        _run_locked(config, logger)
+
+
+def _run_locked(config, logger):
+    global _changes
+    digest = _inputs_digest(config)
+    if _skip_failed_inputs(digest, logger):
+        return
+
     backup_dir = _create_backup(logger)
     if not backup_dir:
         logger.error("Backup failed, aborting run")
         return
 
-    changed  = False
-    changed |= apply_nginx_conf(config, logger)
-    changed |= apply_http3_enable(config, logger)
-    changed |= apply_quic_gso_enable(config, logger)
-    # generate cache-exclude files before their includes are (re)confirmed below
-    changed |= _apply_cache_excludes(config, logger)
-    changed |= apply_include_features(config, logger)
-    changed |= apply_logging_features(config, logger)
-    changed |= apply_fastcgi_cache_settings(config, logger)
-    changed |= apply_client_max_body_size(config, logger)
-
-    if not changed:
-        logger.info("All configs up to date, no changes needed")
-        _cleanup_backup(backup_dir, logger)
-        _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
+    changes  = _Changes()
+    _changes = changes
+    try:
+        changed  = False
+        changed |= apply_nginx_conf(config, logger)
+        changed |= apply_http3_enable(config, logger)
+        changed |= apply_quic_gso_enable(config, logger)
+        # generate cache-exclude files before their includes are (re)confirmed below
+        changed |= _apply_cache_excludes(config, logger)
+        changed |= apply_include_features(config, logger)
+        changed |= apply_logging_features(config, logger)
+        changed |= apply_fastcgi_cache_settings(config, logger)
+        changed |= apply_client_max_body_size(config, logger)
+    except Exception as e:
+        logger.error(f"Run aborted: {e}")
+        _changes = None
+        _fail(changes, digest, f"run aborted: {e}", backup_dir, logger)
         return
+    _changes = None
+
+    overrides = _overrides_digest()
+    if not changed and not changes.after:
+        if overrides == _read_text(OVERRIDES_STATE):
+            logger.info("All configs up to date, no changes needed")
+            _clear_failed_inputs()
+            _cleanup_backup(backup_dir, logger)
+            _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
+            return
+        logger.warning("Override files changed since nginx last loaded them, reloading")
 
     # nginx -t opens every log file as root: check the destinations first
     if not log_preflight_ok(logger, "testing or reloading the nginx config"):
-        if _restore_backup(backup_dir, logger):
-            logger.info("Configs restored from backup")
-        _cleanup_backup(backup_dir, logger)
+        _fail(changes, digest, "log destination check failed", backup_dir, logger)
         return
 
     ok, output = _test_nginx()
     if not ok:
         logger.error(f"nginx -t failed: {output}")
-        if _restore_backup(backup_dir, logger):
-            logger.info("Configs restored from backup")
-        _cleanup_backup(backup_dir, logger)
+        _fail(changes, digest, f"nginx -t failed: {output.strip()[-300:]}", backup_dir, logger)
         return
 
     if _reload_nginx(logger):
         logger.info("Configuration updated, nginx reloaded")
+        _clear_failed_inputs()
+        try:
+            _nginxconf().write_atomic(OVERRIDES_STATE, overrides)
+        except Exception as e:
+            logger.error(f"Failed to record the loaded overrides: {e}")
     else:
         logger.error(f"nginx reload failed — restoring backup and restarting service")
-        if _restore_backup(backup_dir, logger):
-            if not log_preflight_ok(logger, "reloading the restored config"):
-                pass
-            elif _reload_nginx(logger):
-                logger.info("Restored config reloaded successfully")
-            else:
-                logger.error("Reload of restored config also failed")
+        changes.undo(logger)
+        _record_failed_inputs(digest, "nginx reload failed")
+        if not log_preflight_ok(logger, "reloading the restored config"):
+            pass
+        elif _reload_nginx(logger):
+            logger.info("Restored config reloaded successfully")
         else:
-            logger.error("Backup restore failed")
+            logger.error("Reload of restored config also failed")
         # flush logs before forcing process exit so systemd restarts cleanly
         logging.shutdown()
         os._exit(0)
 
     _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
+
+
+def _fail(changes, digest, reason, backup_dir, logger):
+    """Undo the run's file changes and remember its inputs as failed."""
+    if changes.undo(logger):
+        logger.info("Configs restored from backup")
+    _record_failed_inputs(digest, reason)
+    _cleanup_backup(backup_dir, logger)
+
+
+# ---------------------------------------------------------------------------
+# File changes of a run, and undo
+# ---------------------------------------------------------------------------
+
+class _Changes:
+    """Every file a run writes or removes, with its content before the run, so a
+    failed run is undone exactly: files it created are removed, files it removed
+    come back (cache-exclude files included), and nothing else is touched. A
+    file that something else changed or removed since the run wrote it (e.g.
+    Enhance rewrote or deleted the vhost) is left as it is."""
+
+    def __init__(self):
+        self.before = {}    # path -> bytes, or None if it did not exist
+        self.after  = {}    # path -> bytes written, or None if removed
+
+    def _remember(self, path):
+        if path not in self.before:
+            try:
+                self.before[path] = path.read_bytes()
+            except FileNotFoundError:
+                self.before[path] = None
+
+    def write(self, path, text):
+        path = Path(path)
+        self._remember(path)
+        data = text.encode() if isinstance(text, str) else text
+        _nginxconf().write_atomic(path, data)
+        self.after[path] = data
+
+    def unlink(self, path):
+        path = Path(path)
+        self._remember(path)
+        path.unlink()
+        self.after[path] = None
+
+    def undo(self, logger):
+        """Put every touched file back. Returns False if one could not be."""
+        ok, restored = True, 0
+        for path in reversed(list(self.after)):
+            try:
+                current = path.read_bytes()
+            except FileNotFoundError:
+                current = None
+            if current != self.after[path]:
+                logger.warning(f"Not restoring {path}: changed by something else during the run")
+                continue
+            before = self.before[path]
+            try:
+                if before is None:
+                    path.unlink()
+                else:
+                    _nginxconf().write_atomic(path, before)
+                restored += 1
+            except Exception as e:
+                logger.error(f"Failed to restore {path}: {e}")
+                ok = False
+        logger.info(f"Undid {restored} file change(s)")
+        return ok
+
+
+_changes = None     # _Changes of the run in progress (the lock serialises runs)
+
+
+def _write(path, text):
+    """Write a config file atomically, recorded for undo during a run."""
+    if _changes is not None:
+        _changes.write(path, text)
+    else:
+        _nginxconf().write_atomic(path, text)
+
+
+def _unlink(path):
+    if _changes is not None:
+        _changes.unlink(path)
+    else:
+        Path(path).unlink()
+
+
+class _FS:
+    """File operations handed to nginxcacheexclude, so its writes are undone too."""
+    write  = staticmethod(_write)
+    unlink = staticmethod(_unlink)
+
+
+# ---------------------------------------------------------------------------
+# Failed-run memory: no restore → inotify → run → fail loop
+# ---------------------------------------------------------------------------
+
+_skip_logged = None
+
+
+def _inputs_digest(config):
+    """Hash of everything a run's outcome depends on: settings, this code and the
+    overrides, nginx.conf and every file a vhost includes from our directories."""
+    h = hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode())
+
+    def entries(d, pattern="*"):
+        try:
+            return sorted(p for p in d.glob(pattern) if not p.name.startswith("."))
+        except OSError:
+            return []
+
+    paths = ([MODULES_DIR / "nginxtune", MODULES_DIR / "nginxcacheexclude",
+              MODULES_DIR / "nginxconf", NGINX_CONF]
+             + entries(OVERRIDES, "*.conf") + entries(SITES_DIR)
+             + entries(CACHE_EXCLUDES_DIR, "*.conf") + entries(REDIRECTS_DIR, "*.conf"))
+    for p in paths:
+        h.update(str(p).encode() + b"\0")
+        try:
+            h.update(p.read_bytes())
+        except OSError:
+            h.update(b"<unreadable>")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _overrides_digest():
+    h = hashlib.sha256()
+    try:
+        files = sorted(p for p in OVERRIDES.glob("*.conf") if not p.name.startswith("."))
+    except OSError:
+        files = []
+    for p in files:
+        h.update(p.name.encode() + b"\0")
+        try:
+            h.update(p.read_bytes())
+        except OSError:
+            h.update(b"<unreadable>")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _read_text(path):
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def _read_failed_inputs():
+    try:
+        return json.loads(FAILED_STATE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _record_failed_inputs(digest, reason):
+    try:
+        _nginxconf().write_atomic(FAILED_STATE, json.dumps(
+            {"digest": digest, "time": time.time(), "reason": reason[:500]}))
+    except Exception:
+        pass
+
+
+def _clear_failed_inputs():
+    global _skip_logged
+    _skip_logged = None
+    try:
+        FAILED_STATE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _skip_failed_inputs(digest, logger):
+    """True if the last failed run had exactly these inputs, less than
+    RETRY_AFTER seconds ago. Logs once per failed state."""
+    global _skip_logged
+    st = _read_failed_inputs()
+    if not st or st.get("digest") != digest:
+        return False
+    age = time.time() - float(st.get("time", 0))
+    if age >= RETRY_AFTER:
+        return False
+    if _skip_logged != digest:
+        logger.warning(
+            f"Not applying: nothing changed since the run that failed {int(age)}s ago "
+            f"({st.get('reason', '?')}). Retrying on the next vhost or settings change, "
+            f"or after {RETRY_AFTER // 60} min.")
+        _skip_logged = digest
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +571,9 @@ def run(config, logger):
 
 def _create_backup(logger):
     """
-    Copy all vhost confs and nginx.conf to a timestamped backup directory.
-    Returns the path or None on failure.
+    Copy all vhost confs, nginx.conf and the cache-exclude files to a timestamped
+    backup directory, for manual recovery (a failed run is undone from its own
+    record of changes). Returns the path or None on failure.
     """
     backup_dir = BACKUP_BASE / datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
@@ -341,26 +582,16 @@ def _create_backup(logger):
             shutil.copy2(f, backup_dir)
         if NGINX_CONF.exists():
             shutil.copy2(NGINX_CONF, backup_dir / NGINX_CONF.name)
+        if CACHE_EXCLUDES_DIR.is_dir():
+            ce = backup_dir / "cache-excludes"
+            ce.mkdir(exist_ok=True)
+            for f in CACHE_EXCLUDES_DIR.glob("*.conf"):
+                shutil.copy2(f, ce)
         logger.info(f"Backup created: {backup_dir}")
         return backup_dir
     except Exception as e:
         logger.error(f"Failed to create backup: {e}")
         return None
-
-
-def _restore_backup(backup_dir, logger):
-    """Restore vhost confs and nginx.conf from a backup directory. Returns True on success."""
-    try:
-        for f in backup_dir.glob("*.conf"):
-            if f.name == NGINX_CONF.name:
-                shutil.copy2(f, NGINX_CONF)
-            else:
-                shutil.copy2(f, SITES_DIR / f.name)
-        logger.info(f"Restored from backup: {backup_dir}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to restore backup: {e}")
-        return False
 
 
 def _cleanup_backup(backup_dir, logger):
@@ -519,7 +750,7 @@ def apply_nginx_conf(config, logger):
         return False
 
     try:
-        NGINX_CONF.write_text(new_content)
+        _write(NGINX_CONF, new_content)
         action = "enabled" if effective else "disabled"
         logger.warning(f"apply_nginx_conf: quic directives {action} — updated nginx.conf")
         return True
@@ -693,7 +924,7 @@ def apply_http3_enable(config, logger):
                 new_lines.append(line)
 
         try:
-            cf.write_text("".join(new_lines))
+            _write(cf, "".join(new_lines))
             action = "enabled" if http3 else "disabled"
             logger.warning(f"http3_enable: {action} — updated {filename}")
             any_changed = True
@@ -730,7 +961,7 @@ def apply_quic_gso_enable(config, logger):
 
         new_lines = [l for l in lines if l.strip() != "quic_gso on;"]
         try:
-            cf.write_text("".join(new_lines))
+            _write(cf, "".join(new_lines))
             logger.warning(f"quic_directives_enable: removed quic_gso from vhost — {filename}")
             any_changed = True
         except Exception as e:
@@ -829,7 +1060,7 @@ def apply_include_features(config, logger):
             ce_path = CACHE_EXCLUDES_DIR / f"{cf.stem}.conf"
             if not ce_path.exists():
                 try:
-                    ce_path.write_text("")
+                    _write(ce_path, "")
                 except Exception as e:
                     logger.error(f"Failed to create placeholder cache-exclude for {cf.stem}: {e}")
 
@@ -908,7 +1139,7 @@ def apply_include_features(config, logger):
                     break
 
         try:
-            cf.write_text("".join(new_lines))
+            _write(cf, "".join(new_lines))
             parts = []
             if to_add:
                 names = [k for k, v in include_map.items() if v in to_add]
@@ -1196,7 +1427,7 @@ def apply_logging_features(config, logger):
             continue
 
         try:
-            cf.write_text(new_text)
+            _write(cf, new_text)
             parts = []
             if has_pers_log != bool(pers_added):
                 parts.append(f"persistent logging {'enabled' if pers_added else 'disabled'}")
@@ -1222,7 +1453,7 @@ def _write_checked(cf, text, logger):
     nc = _nginxconf()
     try:
         nc.parse(text)
-        cf.write_text(text)
+        _write(cf, text)
         return True
     except (nc.ConfError, OSError) as e:
         logger.error(f"Failed to write {cf.name}: {e}")
@@ -1392,7 +1623,7 @@ def apply_fastcgi_cache_settings(config, logger):
                 new_lines.append(line)
 
         try:
-            cf.write_text("".join(new_lines))
+            _write(cf, "".join(new_lines))
             logger.warning(f"fastcgi_cache_settings: updated {filename}")
             any_changed = True
         except Exception as e:
@@ -1468,7 +1699,7 @@ def apply_client_max_body_size(config, logger):
                     new_lines.append(line)
 
             try:
-                cf.write_text("".join(new_lines))
+                _write(cf, "".join(new_lines))
                 logger.warning(f"client_max_body_size: restored control panel values — {filename}")
                 any_changed = True
             except Exception as e:
@@ -1497,7 +1728,7 @@ def apply_client_max_body_size(config, logger):
                     new_lines.append(line)
 
             try:
-                cf.write_text("".join(new_lines))
+                _write(cf, "".join(new_lines))
                 logger.warning(f"client_max_body_size: set to {cfg_size} — {filename}")
                 any_changed = True
             except Exception as e:
@@ -1512,6 +1743,11 @@ def apply_client_max_body_size(config, logger):
 
 def cleanup(logger):
     """Strip all nginxtune-managed content from vhost confs and nginx.conf."""
+    with _nginxconf().nginx_lock(NGINX_LOCK):
+        _cleanup_locked(logger)
+
+
+def _cleanup_locked(logger):
     logger.warning("nginxtune cleanup: resetting all vhost confs to defaults")
     apply_nginx_conf(            {}, logger)
     apply_http3_enable(          {}, logger)

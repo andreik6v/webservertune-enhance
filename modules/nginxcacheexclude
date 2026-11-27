@@ -151,14 +151,26 @@ def _build_content(is_wp, is_wc, woocommerce_on):
 # Entry point — called by nginxtune.run() / nginxtune.cleanup()
 # ---------------------------------------------------------------------------
 
-def _remove_all(logger):
+class _PlainFS:
+    """Default file operations. nginxtune passes its own, which record every
+    change so a failed run can be undone."""
+    @staticmethod
+    def write(path, text):
+        path.write_text(text)
+
+    @staticmethod
+    def unlink(path):
+        path.unlink()
+
+
+def _remove_all(logger, fs):
     """Remove every generated cache-exclude file. Returns True if any were removed."""
     changed = False
     if not CACHE_EXCLUDES_DIR.is_dir():
         return False
     for conf in CACHE_EXCLUDES_DIR.glob("*.conf"):
         try:
-            conf.unlink()
+            fs.unlink(conf)
             logger.info(f"Removed cache-exclude conf: {conf.name}")
             changed = True
         except Exception as e:
@@ -166,7 +178,7 @@ def _remove_all(logger):
     return changed
 
 
-def apply(config, logger):
+def apply(config, logger, fs=None):
     """
     Regenerate per-domain cache-exclude include files to match the current set of
     vhosts and their detected WordPress/WooCommerce status. Writes only changed
@@ -179,12 +191,13 @@ def apply(config, logger):
 
     Returns True if any file was written or removed.
     """
+    fs = fs or _PlainFS
     section        = config.get("nginx-cacheexclude", {})
     enabled        = section.get("enabled", False)
     woocommerce_on = section.get("woocommerce", True)
 
     if not enabled:
-        return _remove_all(logger)
+        return _remove_all(logger, fs)
 
     CACHE_EXCLUDES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -214,7 +227,7 @@ def apply(config, logger):
         if existing == new:
             continue
         try:
-            path.write_text(new)
+            fs.write(path, new)
             kind = ("with WooCommerce" if (is_wc and woocommerce_on)
                     else "WordPress" if is_wp else "empty (non-WordPress)")
             logger.warning(f"cache-exclude: updated {cf.stem}.conf ({kind})")
@@ -226,7 +239,7 @@ def apply(config, logger):
     for conf in CACHE_EXCLUDES_DIR.glob("*.conf"):
         if conf.stem not in current_doms:
             try:
-                conf.unlink()
+                fs.unlink(conf)
                 logger.warning(f"cache-exclude: removed stale {conf.name}")
                 changed = True
             except Exception as e:
